@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/satrap-verifier.schema.json",
+  "title": "SatrapVerificationVerdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "passed"
+  ],
+  "properties": {
+    "passed": {
+      "type": "boolean",
+      "description": "True if the implementation satisfies the step's done_when criteria; false otherwise."
+    },
+    "note": {
+      "type": "string",
+      "description": "Required when passed=false. Explain what failed and what to change next.",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "passed": {
+            "const": false
+          }
+        },
+        "required": [
+          "passed"
+        ]
+      },
+      "then": {
+        "required": [
+          "note"
+        ]
+      }
+    }
+  ]
+}
+
