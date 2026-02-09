@@ -1,12 +1,9 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.com/schemas/satrap-verifier.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "SatrapVerificationVerdict",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "passed"
-  ],
+  "required": ["passed"],
   "properties": {
     "passed": {
       "type": "boolean",
@@ -14,28 +11,9 @@
     },
     "note": {
       "type": "string",
-      "description": "Required when passed=false. Explain what failed and what to change next.",
-      "minLength": 1
+      "minLength": 1,
+      "description": "Explain what failed and what to change next (recommended when passed=false)."
     }
-  },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "passed": {
-            "const": false
-          }
-        },
-        "required": [
-          "passed"
-        ]
-      },
-      "then": {
-        "required": [
-          "note"
-        ]
-      }
-    }
-  ]
+  }
 }
 

@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the single source of truth todo JSON (default: ./todo.json).",
     )
     p.add_argument(
+        "--reset-todo",
+        action="store_true",
+        help="Overwrite the todo JSON with a fresh plan for the provided task input.",
+    )
+    p.add_argument(
         "--schema-json",
         default="todo-schema.json",
         help="Path to the todo JSON schema passed to the planner backend.",
@@ -79,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Worker CLI executable (default: claude).",
     )
     p.add_argument(
+        "--no-worktree-panes",
+        action="store_true",
+        help="When running inside tmux, do not spawn a new pane per worktree worker attempt.",
+    )
+    p.add_argument(
         "--max-parallel",
         type=int,
         default=1,
@@ -89,10 +99,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not auto-run satrap inside a new tmux pane.",
     )
-    p.add_argument(
+    pane_group = p.add_mutually_exclusive_group()
+    pane_group.add_argument(
         "--keep-pane",
         action="store_true",
-        help="When auto-running in tmux, keep the pane open after satrap exits.",
+        help="Keep the auto-spawned satrap pane open after exit (default).",
+    )
+    pane_group.add_argument(
+        "--kill-pane",
+        action="store_true",
+        help="When auto-running in tmux, kill the satrap pane after it exits.",
     )
     return p
 
@@ -108,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     verifier_schema_json = (control_root / args.verifier_schema_json).resolve()
 
     if in_tmux() and not args.no_tmux:
+        print("[satrap] spawning tmux pane...", file=sys.stderr)
         window_name = os.environ.get("SATRAP_TMUX_WINDOW", "satrap")
         window = ensure_window(window_name=window_name, cwd=control_root)
         spawn_pane(
@@ -116,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
             cwd=control_root,
             title="satrap",
             env={"SATRAP_CONTROL_ROOT": str(control_root)},
-            keep_pane=bool(args.keep_pane),
+            keep_pane=(not bool(args.kill_pane)),
         )
         return 0
 
@@ -131,7 +148,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         git = GitClient(control_root=control_root)
         planner = ExternalPlannerBackend(cmd=args.planner_cmd)
-        worker = ExternalWorkerBackend(cmd=args.worker_cmd)
+        tmux_window_name = os.environ.get("SATRAP_TMUX_WINDOW", "satrap")
+        worker = ExternalWorkerBackend(
+            cmd=args.worker_cmd,
+            control_root=control_root,
+            use_tmux_panes=(not bool(args.no_worktree_panes)),
+            tmux_window_name=tmux_window_name,
+        )
         verifier = ExternalVerifierBackend(cmd=args.verifier_cmd, schema_file=verifier_schema_json)
 
     cfg = SatrapConfig(
@@ -148,5 +171,5 @@ def main(argv: list[str] | None = None) -> int:
     orch = SatrapOrchestrator(cfg)
 
     task_text = _read_task_input(args.task)
-    orch.run(task_text=task_text, start_step=args.step)
+    orch.run(task_text=task_text, start_step=args.step, reset_todo=bool(args.reset_todo))
     return 0

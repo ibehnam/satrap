@@ -80,15 +80,12 @@ def run_claude_json_from_files(
     raw_stdout = "".join(out_chunks).strip()
     stderr = "".join(err_chunks).strip()
 
-    stdout = _extract_print_result(raw_stdout) or raw_stdout
-    stdout = stdout.strip()
+    extracted = _extract_structured_or_printed_result(raw_stdout)
+    stdout = extracted.print_text.strip()
     if stdout:
         sys.stdout.write(stdout + "\n")
         sys.stdout.flush()
-
-    data: Any | None = None
-    if stdout:
-        data = _best_effort_parse_json(stdout)
+    data: Any | None = extracted.data
 
     return ClaudeJSONResult(exit_code=code, stdout=stdout, stderr=stderr, data=data)
 
@@ -126,30 +123,72 @@ def _best_effort_parse_json(text: str) -> Any | None:
         return None
 
 
-def _extract_print_result(raw_stdout: str) -> str | None:
-    """Extract the assistant's final `result` string from `claude --output-format json`.
+@dataclass(frozen=True)
+class _ClaudeExtracted:
+    # Schema-validated payload (present when `--json-schema` is used).
+    data: Any | None
+    # Human/debug output to print.
+    print_text: str
 
-    Claude Code emits a JSON envelope (often a list of event objects). We care about the final
-    `type=="result"` object's `result` field, which contains the printed assistant response.
+
+def _parse_envelope(raw_stdout: str) -> Any | None:
+    """Parse `claude --output-format json` stdout.
+
+    Claude Code typically emits a single JSON array. If that changes to JSONL,
+    we fall back to parsing line-by-line.
     """
     if not raw_stdout.strip():
         return None
 
     env = _best_effort_parse_json(raw_stdout)
+    if env is not None:
+        return env
+
+    items: list[Any] = []
+    for ln in raw_stdout.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            items.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return items if items else None
+
+
+def _extract_structured_or_printed_result(raw_stdout: str) -> _ClaudeExtracted:
+    """Extract structured output (preferred) or printed result text.
+
+    With `--json-schema`, Claude Code may return a `structured_output` payload on the final
+    `type=="result"` event. The printed `result` string is often non-JSON and should not be
+    used as the structured output source of truth.
+    """
+    env = _parse_envelope(raw_stdout)
     if env is None:
-        return None
+        return _ClaudeExtracted(data=None, print_text=raw_stdout.strip())
 
+    result_ev: dict | None = None
     if isinstance(env, dict):
-        res = env.get("result")
-        return res if isinstance(res, str) else None
-
-    if isinstance(env, list):
+        result_ev = env
+    elif isinstance(env, list):
         for it in reversed(env):
-            if not isinstance(it, dict):
-                continue
-            if it.get("type") != "result":
-                continue
-            res = it.get("result")
-            return res if isinstance(res, str) else None
+            if isinstance(it, dict) and it.get("type") == "result":
+                result_ev = it
+                break
 
-    return None
+    if result_ev is None:
+        return _ClaudeExtracted(data=None, print_text=raw_stdout.strip())
+
+    structured = result_ev.get("structured_output")
+    if structured is not None:
+        # Prefer printing normalized JSON for observability.
+        try:
+            return _ClaudeExtracted(data=structured, print_text=json.dumps(structured, indent=2, sort_keys=True))
+        except TypeError:
+            return _ClaudeExtracted(data=structured, print_text=str(structured))
+
+    res = result_ev.get("result")
+    if isinstance(res, str) and res.strip():
+        return _ClaudeExtracted(data=_best_effort_parse_json(res), print_text=res.strip())
+
+    return _ClaudeExtracted(data=None, print_text=raw_stdout.strip())

@@ -141,6 +141,13 @@ class TodoDoc:
     def is_done(self, number: str) -> bool:
         return self.get_item(number).status == TodoStatus.DONE
 
+    def is_complete(self) -> bool:
+        """True when all items (including descendants) are DONE.
+
+        Empty todo lists are treated as complete.
+        """
+        return all(it.status == TodoStatus.DONE for it in self._walk_items(self.items))
+
     def get_item(self, number: str) -> TodoItem:
         for item in self._walk_items(self.items):
             if item.number == number:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+import sys
 from .agents import (
     PlannerBackend,
     PlannerResult,
@@ -48,12 +50,15 @@ class SatrapOrchestrator:
     def __init__(self, cfg: SatrapConfig) -> None:
         self.cfg = cfg
 
-    def run(self, *, task_text: str, start_step: str | None) -> None:
+    def run(self, *, task_text: str, start_step: str | None, reset_todo: bool = False) -> None:
         """Entry point for the CLI.
 
         `task_text` is only used to initialize `todo.json` when it does not exist.
         """
-        todo = self._load_or_init_todo(task_text=task_text)
+        todo = self._load_or_init_todo(task_text=task_text, reset_todo=reset_todo)
+        print(f"[satrap] todo: {self.cfg.todo_json_path}", file=sys.stderr)
+        print(f"[satrap] todo context: {(todo.context or '').strip()!r}", file=sys.stderr)
+        print(f"[satrap] todo stats: items={len(todo.items)} complete={todo.is_complete()}", file=sys.stderr)
 
         base_branch = self.cfg.git.current_branch(cwd=self.cfg.control_root)
         root_branch = "satrap/root"
@@ -63,10 +68,14 @@ class SatrapOrchestrator:
             worktrees_dir=self.cfg.worktrees_dir,
             phrases_path=self.cfg.phrases_path,
         )
+        print(f"[satrap] root worktree: {root_wt.branch} -> {root_wt.path}", file=sys.stderr)
 
         if start_step is None:
             self._ensure_planned(todo=todo, step_number=None)
             todo = self._reload_todo()
+            if todo.is_complete():
+                print("[satrap] all steps DONE; nothing to do.", file=sys.stderr)
+                return
             for batch in dependency_batches(todo.items, is_done=lambda n: self._reload_todo().is_done(n)):
                 # Placeholder: this can be parallelized safely once git worktree concurrency rules are settled.
                 for item in batch:
@@ -106,6 +115,7 @@ class SatrapOrchestrator:
             worktrees_dir=self.cfg.worktrees_dir,
             phrases_path=self.cfg.phrases_path,
         )
+        print(f"[satrap] step worktree: {step_wt.branch} -> {step_wt.path}", file=sys.stderr)
 
         self._ensure_planned(todo=todo, step_number=step_number)
         todo = self._reload_todo()
@@ -135,6 +145,8 @@ class SatrapOrchestrator:
             if todo.get_item(step_number).children:
                 return
 
+        target = "root" if step_number is None else f"step {step_number}"
+        print(f"[satrap] planning: {target}", file=sys.stderr)
         planner_prompt = write_agent_prompt(
             cfg=self.cfg,
             todo=todo,
@@ -177,6 +189,7 @@ class SatrapOrchestrator:
         )
 
         for tier in self.cfg.model_tiers:
+            print(f"[satrap] worker tier: {' '.join(tier)} step={step.number}", file=sys.stderr)
             worker_prompt = write_agent_prompt(
                 cfg=self.cfg,
                 todo=todo,
@@ -257,9 +270,36 @@ class SatrapOrchestrator:
         updated = _append_under_section(existing, header="## Satrap", content=entry)
         self.cfg.lessons_path.write_text(updated, encoding="utf-8")
 
-    def _load_or_init_todo(self, *, task_text: str) -> TodoDoc:
+    def _load_or_init_todo(self, *, task_text: str, reset_todo: bool) -> TodoDoc:
         if self.cfg.todo_json_path.exists():
-            return TodoDoc.load(self.cfg.todo_json_path)
+            todo = TodoDoc.load(self.cfg.todo_json_path)
+            incoming = task_text.strip()
+            existing = (todo.context or "").strip()
+            if reset_todo or (incoming and incoming != existing):
+                if not reset_todo and (not todo.is_complete()) and todo.items:
+                    raise RuntimeError(
+                        "todo.json already exists for a different task and is not complete. "
+                        "Use --reset-todo to overwrite, or pass --todo-json to use a separate file."
+                    )
+
+                # Archive the prior todo.json for traceability.
+                hist_dir = (self.cfg.control_root / ".satrap" / "todo-history").resolve()
+                hist_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                archive = hist_dir / f"todo-{ts}.json"
+                try:
+                    archive.write_text(self.cfg.todo_json_path.read_text(encoding="utf-8"), encoding="utf-8")
+                except Exception:
+                    # Best-effort archival; do not block reset on history write failures.
+                    pass
+
+                reason = "forced by --reset-todo" if reset_todo else "new task input and previous plan complete"
+                print(f"[satrap] resetting todo.json ({reason})", file=sys.stderr)
+                title = (incoming.splitlines() or ["satrap task"])[0][:512] or "satrap task"
+                todo = TodoDoc(title=title, context=task_text, items=[])
+                self._save_todo(todo)
+                return todo
+            return todo
         title = (task_text.strip().splitlines() or ["satrap task"])[0][:512] or "satrap task"
         todo = TodoDoc(title=title, context=task_text, items=[])
         self._save_todo(todo)

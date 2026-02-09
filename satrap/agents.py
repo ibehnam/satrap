@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .claude_cli import run_claude_json_from_files
+from .tmux import ensure_window, in_tmux, shell_argv, spawn_pane_remain_on_exit, wait_for
 from .todo import TodoItem, TodoItemSpec
 
 WorkerTier = list[str]
@@ -133,30 +134,100 @@ class ExternalWorkerBackend:
     CLIs later (e.g. Codex) without changing orchestration code.
     """
 
-    def __init__(self, *, cmd: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        cmd: str | None = None,
+        control_root: Path,
+        use_tmux_panes: bool = True,
+        tmux_window_name: str = "satrap",
+    ) -> None:
         self.cmd = cmd or "claude"
+        self.control_root = control_root
+        self.use_tmux_panes = use_tmux_panes
+        self.tmux_window_name = tmux_window_name
 
     def spawn(self, *, tier: WorkerTier, prompt_file: Path, cwd: Path) -> "WorkerRun":
         import subprocess
+        import uuid
+        import shlex
 
         model = tier[0] if tier else "ccss-sonnet"
         prompt = prompt_file.read_text(encoding="utf-8")
         argv = [self.cmd, "--model", model, "-p", prompt, "--dangerously-skip-permissions"]
-        p = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=1,
-        )
-        return WorkerRun(tier=tier, prompt_file=prompt_file, cwd=cwd, opaque=p)
+        if in_tmux() and self.use_tmux_panes:
+            runs_dir = (self.control_root / ".satrap" / "runs").resolve()
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            run_id = uuid.uuid4().hex
+            exit_file = runs_dir / f"worker-{run_id}.exit"
+            wait_key = f"satrap-worker-{run_id}"
+
+            # Run the worker in its own pane, inside the worktree dir, and signal completion.
+            # We write the exit code to a file so the parent process can read it reliably.
+            step_key = prompt_file.name
+            # "<step>-worker.md" where step uses "-" instead of "." (e.g. "1-2-worker.md").
+            if step_key.endswith("-worker.md"):
+                step_key = step_key[: -len("-worker.md")]
+            step_label = step_key.replace("-", ".")
+
+            script = "\n".join(
+                [
+                    f"exit_file={shlex.quote(str(exit_file))}",
+                    f"wait_key={shlex.quote(wait_key)}",
+                    # Ensure the parent is always unblocked, even if the worker crashes early.
+                    "trap 'code=$?; echo $code > \"$exit_file\"; tmux wait-for -S \"$wait_key\"' EXIT",
+                    " ".join(shlex.quote(a) for a in argv),
+                ]
+            )
+            window_target = ensure_window(window_name=self.tmux_window_name, cwd=self.control_root)
+            pane_id = spawn_pane_remain_on_exit(
+                window_target=window_target,
+                argv=shell_argv(script=script),
+                cwd=cwd,
+                title=f"{step_label} {model}",
+                env={"SATRAP_CONTROL_ROOT": str(self.control_root)},
+                select=True,
+            )
+            return WorkerRun(
+                tier=tier,
+                prompt_file=prompt_file,
+                cwd=cwd,
+                opaque={"kind": "tmux", "pane_id": pane_id, "wait_key": wait_key, "exit_file": str(exit_file)},
+            )
+
+        p = subprocess.Popen(argv, cwd=str(cwd), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1)
+        return WorkerRun(tier=tier, prompt_file=prompt_file, cwd=cwd, opaque={"kind": "proc", "p": p})
 
     def watch(self, run: "WorkerRun") -> "WorkerOutcome":
         import selectors
         import sys
+        from pathlib import Path as _Path
 
-        p = run.opaque
+        opaque = run.opaque
+        if not isinstance(opaque, dict):
+            raise RuntimeError("WorkerRun.opaque is missing/invalid.")
+
+        kind = opaque.get("kind")
+        if kind == "tmux":
+            wait_key = opaque.get("wait_key")
+            exit_file = opaque.get("exit_file")
+            if not isinstance(wait_key, str) or not wait_key:
+                raise RuntimeError("WorkerRun.opaque.wait_key is missing for tmux worker.")
+            if not isinstance(exit_file, str) or not exit_file:
+                raise RuntimeError("WorkerRun.opaque.exit_file is missing for tmux worker.")
+
+            wait_for(key=wait_key)
+            try:
+                code_s = _Path(exit_file).read_text(encoding="utf-8").strip()
+                code = int(code_s)
+            except Exception:
+                code = 1
+            return WorkerOutcome(exit_code=code, note=None)
+
+        if kind != "proc":
+            raise RuntimeError(f"Unknown worker run kind: {kind!r}")
+
+        p = opaque.get("p")
         if p is None:
             raise RuntimeError("WorkerRun.opaque is missing (expected subprocess handle).")
 

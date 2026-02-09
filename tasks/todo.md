@@ -27,3 +27,16 @@
 - Wired planner + verifier backends to Claude CLI with schemas loaded via `jq -c` from `todo-schema.json` and `verifier-schema.json` (run with `--output-format json`, extract final `result`, then parse).
 - Updated tmux integration so running `satrap` in tmux spawns a new pane in a dedicated window (`$SATRAP_TMUX_WINDOW`, default `satrap`) and auto-closes it on completion.
 - Wired worker backend to Claude Code using `--dangerously-skip-permissions` and tiered models: `ccss-haiku` → `ccss-sonnet` → `ccss-opus` → `ccss-default` (configurable via `--worker-tiers`, `--worker-cmd`).
+
+## 2026-02-09: Tmux Per-Worktree Panes + Reliable Re-runs
+
+### Plan
+- [x] Make tmux behavior match spec: worker attempts run in a new tmux pane per step worktree and panes remain visible after exit.
+- [x] Prevent "satrap did nothing" on a new task: reset/replace `todo.json` when task input changes, with archival history under `.satrap/todo-history/`.
+- [x] Improve observability: always print which `todo.json` is loaded, whether it's complete, and when satrap is exiting because there's nothing to do.
+- [x] Verify locally with `--no-tmux --dry-run` that reset and logging work; then verify in tmux manually that panes show worker output.
+
+### Results
+- [x] Worker attempts now run in per-step worktree tmux panes (remain visible after exit) instead of only running in the top-level satrap pane.
+- [x] `todo.json` now resets when task input changes and the previous plan is complete (or when forced via `--reset-todo`), with archival copies under `.satrap/todo-history/`.
+- [x] Satrap now prints explicit diagnostics about which `todo.json` is loaded, its context, and whether it is exiting because all steps are already done.
