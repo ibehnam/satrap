@@ -258,3 +258,66 @@ def test_main_in_tmux_with_no_tmux_flag_runs_inline(
 
     assert rc == 0
     assert called["run"] is True
+
+
+def test_read_task_input_empty_file(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.txt"
+    empty.write_text("", encoding="utf-8")
+    assert cli._read_task_input(str(empty)) == ""
+
+
+def test_read_task_input_nonexistent_file_literal() -> None:
+    path = "/tmp/nonexistent_satrap_test_file_xyz"
+    assert cli._read_task_input(path) == path
+
+
+def test_build_parser_defaults() -> None:
+    args = cli.build_parser().parse_args(["task"])
+    assert args.task == "task"
+    assert args.step is None
+    assert args.todo_json == ".satrap/todo.json"
+    assert args.reset_todo is False
+    assert args.schema_json == "todo-schema.json"
+    assert args.dry_run is False
+    assert args.planner_cmd is None
+    assert args.verifier_cmd is None
+    assert args.verifier_schema_json == "verifier-schema.json"
+    assert args.worker_tiers == "ccss-haiku,ccss-sonnet,ccss-opus,ccss-default"
+    assert args.worker_cmd == "claude"
+    assert args.no_worktree_panes is False
+    assert args.max_parallel == 1
+    assert args.no_tmux is False
+    assert args.keep_pane is False
+    assert args.kill_pane is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("single", [["single"]]),
+        ("a,,b", [["a"], ["b"]]),
+        (",,,", []),
+    ],
+)
+def test_worker_tiers_parsing_edge_cases(raw: str, expected: list[list[str]]) -> None:
+    tiers = [s.strip() for s in raw.split(",") if s.strip()]
+    tier_cmds = [[t] for t in tiers]
+    assert tier_cmds == expected
+
+
+def test_control_root_from_cwd_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SATRAP_CONTROL_ROOT", raising=False)
+    monkeypatch.setattr(cli, "in_tmux", lambda: False)
+
+    captured: dict[str, object] = {}
+
+    class FakeOrchestrator:
+        def __init__(self, cfg: object) -> None:
+            captured["cfg"] = cfg
+
+        def run(self, **kwargs: object) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "SatrapOrchestrator", FakeOrchestrator)
+    cli.main(["task", "--dry-run"])
+    assert captured["cfg"].control_root == Path.cwd().resolve()

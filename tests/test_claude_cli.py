@@ -184,3 +184,78 @@ def test_run_claude_json_from_files_streams_stderr_and_emits_normalized_stdout(
         "json",
     ]
     assert captured["cmd"][-2:] == ["--output-format", "json"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", None),
+        ("hello world", None),
+        ('prefix {"key": "val"} suffix', {"key": "val"}),
+        ('{"key": "val"', None),
+        ("[1, 2, 3]", [1, 2, 3]),
+        ("42", 42),
+    ],
+)
+def test_best_effort_parse_json_parametrized(text: str, expected: Any) -> None:
+    assert claude_cli._best_effort_parse_json(text) == expected
+
+
+def test_parse_envelope_single_dict() -> None:
+    result = claude_cli._parse_envelope('{"type":"result","result":"ok"}')
+    assert result == {"type": "result", "result": "ok"}
+
+
+def test_parse_envelope_jsonl_mixed_valid_invalid() -> None:
+    raw = "{invalid}\n" + json.dumps({"a": 1}) + "\n\n" + json.dumps({"b": 2}) + "\n"
+    result = claude_cli._parse_envelope(raw)
+    assert result == [{"a": 1}, {"b": 2}]
+
+
+def test_parse_envelope_pure_text() -> None:
+    assert claude_cli._parse_envelope("just plain text") is None
+
+
+def test_extract_empty_events_list() -> None:
+    extracted = claude_cli._extract_structured_or_printed_result(json.dumps([]))
+    assert extracted.data is None
+
+
+def test_extract_no_result_type_events() -> None:
+    env = json.dumps([{"type": "log", "msg": "hi"}, {"type": "event"}])
+    extracted = claude_cli._extract_structured_or_printed_result(env)
+    assert extracted.data is None
+
+
+def test_extract_multiple_result_events_uses_last() -> None:
+    env = json.dumps([
+        {"type": "result", "structured_output": {"first": 1}},
+        {"type": "result", "structured_output": {"last": 2}},
+    ])
+    extracted = claude_cli._extract_structured_or_printed_result(env)
+    assert extracted.data == {"last": 2}
+
+
+def test_extract_structured_output_non_dict() -> None:
+    env = json.dumps([{"type": "result", "structured_output": "just a string"}])
+    extracted = claude_cli._extract_structured_or_printed_result(env)
+    assert extracted.data == "just a string"
+
+
+def test_extract_result_string_non_json() -> None:
+    env = json.dumps([{"type": "result", "result": "not json at all"}])
+    extracted = claude_cli._extract_structured_or_printed_result(env)
+    assert extracted.data is None
+    assert extracted.print_text == "not json at all"
+
+
+def test_extract_unparseable_raw_stdout() -> None:
+    extracted = claude_cli._extract_structured_or_printed_result("totally not json or anything")
+    assert extracted.data is None
+    assert extracted.print_text == "totally not json or anything"
+
+
+def test_extract_single_dict_without_type_result() -> None:
+    raw = json.dumps({"custom_key": "value"})
+    extracted = claude_cli._extract_structured_or_printed_result(raw)
+    assert extracted.data is None

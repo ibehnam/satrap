@@ -198,3 +198,131 @@ def test_get_item_raises_key_error_for_missing_number() -> None:
     doc = TodoDoc(title="t", items=[TodoItem(number="1", text="one")])
     with pytest.raises(KeyError, match="Todo item not found"):
         doc.get_item("does-not-exist")
+
+
+def test_to_dict_extra_overwrites_known_keys() -> None:
+    item = TodoItem(number="1", text="x", extra={"number": "X"})
+    d = item.to_dict()
+    assert d["number"] == "X"
+
+
+@pytest.mark.parametrize(
+    ("details", "expect_key"),
+    [(None, False), ("", False), ("real", True)],
+)
+def test_to_dict_details_emitted_only_when_truthy(details: str | None, expect_key: bool) -> None:
+    item = TodoItem(number="1", text="x", details=details)
+    d = item.to_dict()
+    assert ("details" in d) is expect_key
+
+
+def test_from_dict_missing_number_raises() -> None:
+    with pytest.raises(KeyError):
+        TodoItem.from_dict({"text": "x"})
+
+
+def test_from_dict_missing_text_raises() -> None:
+    with pytest.raises(KeyError):
+        TodoItem.from_dict({"number": "1"})
+
+
+def test_from_dict_deeply_nested_children() -> None:
+    raw = {
+        "number": "1",
+        "text": "level 1",
+        "children": [
+            {
+                "number": "1.1",
+                "text": "level 2",
+                "children": [
+                    {
+                        "number": "1.1.1",
+                        "text": "level 3",
+                        "children": [{"number": "1.1.1.1", "text": "level 4"}],
+                    }
+                ],
+            }
+        ],
+    }
+    item = TodoItem.from_dict(raw)
+    assert item.number == "1"
+    assert item.children[0].number == "1.1"
+    assert item.children[0].children[0].number == "1.1.1"
+    assert item.children[0].children[0].children[0].number == "1.1.1.1"
+
+
+def test_from_dict_null_children_becomes_empty_list() -> None:
+    item = TodoItem.from_dict({"number": "1", "text": "x", "children": None})
+    assert item.children == []
+
+
+def test_from_dict_null_depends_on_and_done_when() -> None:
+    item = TodoItem.from_dict({"number": "1", "text": "x", "depends_on": None, "done_when": None})
+    assert item.depends_on == []
+    assert item.done_when == []
+
+
+@pytest.mark.parametrize("title_value", ["", None])
+def test_load_rejects_empty_title(tmp_path, title_value) -> None:
+    p = tmp_path / "todo.json"
+    p.write_text(json.dumps({"title": title_value, "items": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing required field: title"):
+        TodoDoc.load(p)
+
+
+def test_load_no_items_key_defaults_empty(tmp_path) -> None:
+    p = tmp_path / "todo.json"
+    p.write_text(json.dumps({"title": "T"}), encoding="utf-8")
+    doc = TodoDoc.load(p)
+    assert doc.items == []
+
+
+def test_save_creates_parent_dirs(tmp_path) -> None:
+    deep = tmp_path / "a" / "b" / "c" / "todo.json"
+    doc = TodoDoc(title="deep", items=[TodoItem(number="1", text="step")])
+    doc.save(deep)
+    assert deep.exists()
+    loaded = TodoDoc.load(deep)
+    assert loaded.title == "deep"
+
+
+def test_set_status_nonexistent_raises() -> None:
+    doc = TodoDoc(title="t", items=[TodoItem(number="1", text="one")])
+    with pytest.raises(KeyError, match="Todo item not found"):
+        doc.set_status("999", TodoStatus.DONE)
+
+
+def test_upsert_children_duplicate_numbers() -> None:
+    doc = TodoDoc(
+        title="t",
+        items=[TodoItem(number="1", text="parent")],
+    )
+    doc.upsert_children(
+        "1",
+        [
+            TodoItemSpec(number="1.1", text="first copy", done_when=["a"]),
+            TodoItemSpec(number="1.1", text="second copy", done_when=["b"]),
+        ],
+    )
+    parent = doc.get_item("1")
+    assert len(parent.children) == 2
+
+
+def test_update_from_spec_preserves_none_fields() -> None:
+    item = TodoItem(number="1", text="old", details="old details", depends_on=["a"], done_when=["b"])
+    item.update_from_spec(TodoItemSpec(number="1", text="new", details=None, depends_on=None, done_when=None))
+    assert item.text == "new"
+    assert item.details == "old details"
+    assert item.depends_on == ["a"]
+    assert item.done_when == ["b"]
+
+
+def test_from_spec_defaults() -> None:
+    item = TodoItem.from_spec(TodoItemSpec(number="1", text="t"))
+    assert item.status == TodoStatus.PENDING
+    assert item.depends_on == []
+    assert item.done_when == []
+    assert item.details is None
+    assert item.blocked_reason is None
+    assert item.children == []
+    assert item.extra == {}

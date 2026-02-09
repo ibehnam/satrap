@@ -585,3 +585,179 @@ def test_append_under_section_inserts_missing_header() -> None:
     assert "## Satrap" in out
     assert "new entry" in out
     assert "## Satrap\n- (empty)" not in out
+
+
+def test_append_under_section_existing_content() -> None:
+    text = "# Lessons\n\n## Satrap\n\n### 1 (tier)\n\nexisting note\n"
+    out = _append_under_section(text, header="## Satrap", content="\n### 2 (tier)\n\nnew note\n")
+    assert "existing note" in out
+    assert "new note" in out
+
+
+def test_append_under_section_multiple_sections() -> None:
+    text = "# Lessons\n\n## Codex\n\ncodex stuff\n\n## Satrap\n- (empty)\n"
+    out = _append_under_section(text, header="## Satrap", content="\nnew entry\n")
+    assert "codex stuff" in out
+    assert "new entry" in out
+
+
+def test_load_or_init_todo_same_context_returns_existing(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path)
+    existing = TodoDoc(
+        title="My Task",
+        context="task",
+        items=[TodoItem(number="1", text="step", done_when=["d"], status=TodoStatus.PENDING)],
+    )
+    _save(cfg, existing)
+    orch = SatrapOrchestrator(cfg)
+    todo = orch._load_or_init_todo(task_text="task", reset_todo=False)
+    assert len(todo.items) == 1
+    assert todo.title == "My Task"
+
+
+def test_load_or_init_todo_empty_task_text_fallback(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path)
+    orch = SatrapOrchestrator(cfg)
+    todo = orch._load_or_init_todo(task_text="", reset_todo=False)
+    assert todo.title == "satrap task"
+    assert todo.items == []
+
+
+def test_run_step_skips_done(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    git = FakeGit(control_root=tmp_path)
+    cfg = _make_cfg(tmp_path, git=git)
+    todo = TodoDoc(
+        title="t",
+        context="ctx",
+        items=[TodoItem(number="1", text="done step", done_when=["d"], status=TodoStatus.DONE)],
+    )
+    _save(cfg, todo)
+    orch = SatrapOrchestrator(cfg)
+    parent_wt = GitWorktree(branch="satrap/root", path=tmp_path)
+
+    # Should return early, no worktree or planner calls
+    orch._run_step(todo=todo, step_number="1", parent_branch="satrap/root", parent_wt=parent_wt)
+    assert git.ensure_worktree_calls == []
+
+
+def test_run_step_skips_blocked(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    git = FakeGit(control_root=tmp_path)
+    cfg = _make_cfg(tmp_path, git=git)
+    todo = TodoDoc(
+        title="t",
+        context="ctx",
+        items=[TodoItem(number="1", text="blocked step", done_when=["d"], status=TodoStatus.BLOCKED)],
+    )
+    _save(cfg, todo)
+    orch = SatrapOrchestrator(cfg)
+    parent_wt = GitWorktree(branch="satrap/root", path=tmp_path)
+
+    orch._run_step(todo=todo, step_number="1", parent_branch="satrap/root", parent_wt=parent_wt)
+    assert git.ensure_worktree_calls == []
+
+
+def test_satrap_config_computed_paths(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path)
+    assert cfg.lessons_path == tmp_path / "tasks" / "lessons.md"
+    assert cfg.phrases_path == tmp_path / "phrases.txt"
+    assert cfg.renders_dir == tmp_path / ".satrap" / "renders"
+    assert cfg.worktrees_dir == tmp_path / ".worktrees"
+
+
+def test_load_or_init_todo_archive_failure_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _make_cfg(tmp_path)
+    existing = TodoDoc(title="old", context="old", items=[TodoItem(number="1", text="x", done_when=["d"])])
+    _save(cfg, existing)
+
+    class FrozenDateTime:
+        @classmethod
+        def now(cls) -> object:
+            class _Now:
+                def strftime(self, fmt: str) -> str:
+                    return "20260209-140000"
+
+            return _Now()
+
+    monkeypatch.setattr(orch_mod, "datetime", FrozenDateTime)
+
+    original_write_text = Path.write_text
+
+    def flaky_write_text(self: Path, data: str, encoding: str = "utf-8") -> int:
+        if "todo-history" in self.parts:
+            raise OSError("archive write failed")
+        return original_write_text(self, data, encoding=encoding)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write_text, raising=False)
+
+    orch = SatrapOrchestrator(cfg)
+    todo = orch._load_or_init_todo(task_text="new task", reset_todo=True)
+
+    assert todo.context == "new task"
+    assert todo.items == []
+    assert TodoDoc.load(cfg.todo_json_path).context == "new task"
+
+
+def test_implement_atomic_all_tiers_fail_blocks_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    git = FakeGit(control_root=tmp_path, merge_base_value="base123")
+    worker = FakeWorkerBackend([WorkerOutcome(exit_code=0), WorkerOutcome(exit_code=0)])
+    verifier = FakeVerifierBackend([VerificationResult(passed=False, note="r1"), VerificationResult(passed=False, note="r2")])
+    cfg = _make_cfg(tmp_path, git=git, worker=worker, verifier=verifier, model_tiers=[["t1"], ["t2"]])
+    todo = TodoDoc(title="t", context="ctx", items=[TodoItem(number="1", text="step", done_when=["done"])])
+
+    orch = SatrapOrchestrator(cfg)
+    monkeypatch.setattr(orch_mod, "write_agent_prompt", lambda **_: tmp_path / "worker-blocked-2.md")
+    monkeypatch.setattr(orch_mod, "write_verifier_prompt", lambda **_: tmp_path / "verifier-blocked-2.md")
+
+    step = todo.get_item("1")
+    step_wt = GitWorktree(branch="satrap/1", path=tmp_path / "wt-step-2")
+    parent_wt = GitWorktree(branch="satrap/root", path=tmp_path / "wt-root-2")
+    step_wt.path.mkdir(parents=True, exist_ok=True)
+    parent_wt.path.mkdir(parents=True, exist_ok=True)
+
+    orch._implement_atomic(todo=todo, step=step, step_wt=step_wt, parent_branch="satrap/root", parent_wt=parent_wt)
+
+    assert todo.get_item("1").status == TodoStatus.BLOCKED
+    assert len(git.reset_calls) == 2
+    assert git.merge_into_calls == []
+
+
+def test_ensure_planned_single_item_refinement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    planner = FakePlannerBackend(
+        {
+            "1": PlannerResult(
+                title=None,
+                items=[TodoItemSpec(number="1", text="refined", details="d", depends_on=["9"], done_when=["ok"])],
+            )
+        }
+    )
+    cfg = _make_cfg(tmp_path, planner=planner)
+    todo = TodoDoc(
+        title="x",
+        context="ctx",
+        items=[
+            TodoItem(
+                number="1",
+                text="old",
+                status=TodoStatus.PENDING,
+                done_when=["old"],
+                children=[TodoItem(number="1.1", text="child", done_when=["c"])],
+            )
+        ],
+    )
+
+    orch = SatrapOrchestrator(cfg)
+    monkeypatch.setattr(orch_mod, "write_agent_prompt", lambda **_: tmp_path / "planner-single-refinement.md")
+
+    # No-op due to existing children.
+    orch._ensure_planned(todo=todo, step_number="1")
+
+    # Clear children and re-run to force single-item refinement behavior.
+    todo.get_item("1").children = []
+    orch._ensure_planned(todo=todo, step_number="1")
+
+    item = todo.get_item("1")
+    assert item.text == "refined"
+    assert item.details == "d"
+    assert item.depends_on == ["9"]
+    assert item.done_when == ["ok"]
+    assert item.children == []

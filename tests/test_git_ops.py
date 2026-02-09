@@ -189,3 +189,105 @@ def test_dry_run_client_returns_noop_semantics(tmp_path: Path) -> None:
     assert client.commit_all_if_needed(cwd=tmp_path, message="msg") is None
     assert client.reset_hard("HEAD~1", cwd=tmp_path) is None
     assert client.merge_into(source_branch="a", target_branch="b", cwd=tmp_path) is None
+
+
+def test_worktrees_empty_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    monkeypatch.setattr(client, "_git", lambda args, cwd: "")
+    assert client.worktrees() == {}
+
+
+def test_worktrees_multiple_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    porcelain = "\n".join([
+        f"worktree {tmp_path / 'w1'}",
+        "HEAD aaa",
+        "branch refs/heads/main",
+        "",
+        f"worktree {tmp_path / 'w2'}",
+        "HEAD bbb",
+        "branch refs/heads/feature/a",
+        "",
+        f"worktree {tmp_path / 'w3'}",
+        "HEAD ccc",
+        "branch refs/heads/feature/b",
+        "",
+    ])
+    monkeypatch.setattr(client, "_git", lambda args, cwd: porcelain)
+    result = client.worktrees()
+    assert len(result) == 3
+    assert "main" in result
+    assert "feature/a" in result
+    assert "feature/b" in result
+
+
+def test_current_branch_returns_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    monkeypatch.setattr(client, "_git", lambda args, cwd: "feature/cool\n")
+    assert client.current_branch(cwd=tmp_path) == "feature/cool"
+
+
+def test_merge_base_returns_sha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    monkeypatch.setattr(client, "_git", lambda args, cwd: "abc123def\n")
+    assert client.merge_base(branch="a", other_ref="b", cwd=tmp_path) == "abc123def"
+
+
+def test_diff_since_returns_raw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    raw = "diff --git a/f\n+line\n"
+    monkeypatch.setattr(client, "_git", lambda args, cwd: raw)
+    assert client.diff_since("BASE", cwd=tmp_path) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("sha1\nsha2\nsha3\n", ["sha1", "sha2", "sha3"]),
+        ("", []),
+        ("\n\n", []),
+    ],
+)
+def test_commits_since_returns_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, expected: list[str]
+) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    monkeypatch.setattr(client, "_git", lambda args, cwd: raw)
+    assert client.commits_since("BASE", cwd=tmp_path) == expected
+
+
+def test_reset_hard_calls_correct_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    captured: list[list[str]] = []
+    monkeypatch.setattr(client, "_git", lambda args, cwd: captured.append(args) or "")
+    client.reset_hard("HEAD~1", cwd=tmp_path)
+    assert captured == [["reset", "--hard", "HEAD~1"]]
+
+
+def test_merge_into_calls_correct_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    captured: list[list[str]] = []
+    monkeypatch.setattr(client, "_git", lambda args, cwd: captured.append(args) or "")
+    client.merge_into(source_branch="feat", target_branch="main", cwd=tmp_path)
+    assert captured == [["merge", "--no-ff", "--no-edit", "feat"]]
+
+
+def test_worktrees_blank_lines_between_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = git_ops.GitClient(control_root=tmp_path)
+    porcelain = "\n".join([
+        f"worktree {tmp_path / 'one'}",
+        "HEAD aaa",
+        "branch refs/heads/one",
+        "",
+        "",
+        "",
+        f"worktree {tmp_path / 'two'}",
+        "HEAD bbb",
+        "branch refs/heads/two",
+        "",
+    ])
+    monkeypatch.setattr(client, "_git", lambda args, cwd: porcelain)
+    result = client.worktrees()
+    assert len(result) == 2
+    assert "one" in result
+    assert "two" in result

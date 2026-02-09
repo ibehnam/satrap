@@ -455,3 +455,116 @@ def test_stub_backends_basic_behavior(tmp_path: Path) -> None:
     verdict = verifier.verify(prompt_file=tmp_path / "v.md", diff="", commits=[], step=_todo_step())
     assert verdict.passed is True
     assert verdict.note is None
+
+
+def test_parse_spec_missing_number_key() -> None:
+    with pytest.raises(ValueError, match="missing required string: number"):
+        agents._parse_todo_item_spec({"text": "x"})
+
+
+@pytest.mark.parametrize("number_val", [42, None])
+def test_parse_spec_non_string_number(number_val: object) -> None:
+    with pytest.raises(ValueError, match="missing required string: number"):
+        agents._parse_todo_item_spec({"number": number_val, "text": "x"})
+
+
+def test_parse_spec_missing_text_key() -> None:
+    with pytest.raises(ValueError, match="missing required string: text"):
+        agents._parse_todo_item_spec({"number": "1"})
+
+
+def test_parse_spec_empty_string_number() -> None:
+    with pytest.raises(ValueError, match="missing required string: number"):
+        agents._parse_todo_item_spec({"number": "", "text": "x"})
+
+
+def test_parse_spec_depends_on_non_string_elements() -> None:
+    with pytest.raises(ValueError, match="invalid depends_on"):
+        agents._parse_todo_item_spec({"number": "1", "text": "ok", "depends_on": [1, 2]})
+
+
+def test_parse_spec_done_when_non_string_elements() -> None:
+    with pytest.raises(ValueError, match="invalid done_when"):
+        agents._parse_todo_item_spec({"number": "1", "text": "ok", "done_when": [1, 2]})
+
+
+def test_parse_spec_done_when_filters_whitespace() -> None:
+    out = agents._parse_todo_item_spec({"number": "1", "text": "ok", "done_when": ["real", "  ", ""]})
+    assert out.done_when == ["real"]
+
+
+def test_external_planner_non_string_title_becomes_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        agents,
+        "run_claude_json_from_files",
+        lambda **kwargs: _result(data={"title": 42, "items": [{"number": "1", "text": "step", "done_when": ["d"]}]}),
+    )
+    backend = agents.ExternalPlannerBackend(cmd="p")
+    result = backend.plan(prompt_file=tmp_path / "p.md", schema_file=tmp_path / "s.json", step_number=None)
+    assert result.title is None
+
+
+def test_external_verifier_missing_passed_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agents, "run_claude_json_from_files", lambda **kwargs: _result(data={"note": "x"}))
+    backend = agents.ExternalVerifierBackend(cmd="v", schema_file=tmp_path / "v.json")
+    with pytest.raises(ValueError, match="required boolean field: passed"):
+        backend.verify(prompt_file=tmp_path / "p.md", diff="", commits=[], step=_todo_step())
+
+
+@pytest.mark.parametrize("passed_val", [1, "true", None])
+def test_external_verifier_non_bool_passed(passed_val: object, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agents, "run_claude_json_from_files", lambda **kwargs: _result(data={"passed": passed_val}))
+    backend = agents.ExternalVerifierBackend(cmd="v", schema_file=tmp_path / "v.json")
+    with pytest.raises(ValueError, match="required boolean field: passed"):
+        backend.verify(prompt_file=tmp_path / "p.md", diff="", commits=[], step=_todo_step())
+
+
+def test_external_verifier_rejected_no_note_gets_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(agents, "run_claude_json_from_files", lambda **kwargs: _result(data={"passed": False}))
+    backend = agents.ExternalVerifierBackend(cmd="v", schema_file=tmp_path / "v.json")
+    out = backend.verify(prompt_file=tmp_path / "p.md", diff="", commits=[], step=_todo_step())
+    assert out.passed is False
+    assert out.note == "Rejected with no note."
+
+
+def test_stub_planner_root_plan_shape(tmp_path: Path) -> None:
+    result = agents.StubPlannerBackend().plan(
+        prompt_file=tmp_path / "p.md", schema_file=tmp_path / "s.json", step_number=None
+    )
+    assert isinstance(result.title, str)
+    assert len(result.items) >= 1
+    for item in result.items:
+        assert isinstance(item.number, str)
+        assert isinstance(item.text, str)
+
+
+def test_stub_worker_spawn_watch_shape(tmp_path: Path) -> None:
+    worker = agents.StubWorkerBackend()
+    run = worker.spawn(tier=["m"], prompt_file=tmp_path / "p.md", cwd=tmp_path)
+    outcome = worker.watch(run)
+    assert isinstance(outcome.exit_code, int)
+    assert outcome.exit_code == 0
+
+
+def test_stub_verifier_shape(tmp_path: Path) -> None:
+    verdict = agents.StubVerifierBackend().verify(
+        prompt_file=tmp_path / "v.md", diff="", commits=[], step=_todo_step()
+    )
+    assert verdict.passed is True
+    assert isinstance(verdict.note, (str, type(None)))
+
+
+def test_worker_watch_tmux_corrupted_exit_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    exit_file = tmp_path / "worker.exit"
+    exit_file.write_text("not-a-number\n", encoding="utf-8")
+    monkeypatch.setattr(agents, "wait_for", lambda *, key: None)
+
+    backend = agents.ExternalWorkerBackend(control_root=tmp_path)
+    run = agents.WorkerRun(
+        tier=["m"],
+        prompt_file=tmp_path / "p.md",
+        cwd=tmp_path,
+        opaque={"kind": "tmux", "wait_key": "wk", "exit_file": str(exit_file)},
+    )
+    out = backend.watch(run)
+    assert out.exit_code == 1

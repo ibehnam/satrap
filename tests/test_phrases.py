@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -113,3 +114,54 @@ def test_generate_unique_phrase_rejects_small_dictionary(tmp_path: Path) -> None
 
     with pytest.raises(RuntimeError, match="too small"):
         phrases.generate_unique_phrase(phrases_path=phrases_path, words_path=words_path)
+
+
+@pytest.mark.parametrize(
+    ("word_len", "should_include"),
+    [(2, False), (3, True), (12, True), (13, False)],
+)
+def test_load_words_boundary_lengths(tmp_path: Path, word_len: int, should_include: bool) -> None:
+    word = "a" * word_len
+    dictionary = tmp_path / "dict.txt"
+    dictionary.write_text(word + "\n", encoding="utf-8")
+    result = phrases._load_words(dictionary)
+    assert (word in result) is should_include
+
+
+def test_load_words_ignores_encoding_errors(tmp_path: Path) -> None:
+    dictionary = tmp_path / "dict.txt"
+    dictionary.write_bytes(b"valid\n\xff\xfe\nbadline\n")
+    result = phrases._load_words(dictionary)
+    assert "valid" in result
+
+
+def test_generate_phrase_exhausts_attempts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    words_path = tmp_path / "words.txt"
+    _write_dictionary(words_path, size=1000)
+    phrases_path = tmp_path / "phrases.txt"
+    # Always generate the same phrase
+    monkeypatch.setattr(phrases.secrets, "choice", lambda _words: "waaaa")
+    # Pre-fill with that exact phrase so every attempt collides
+    phrases_path.write_text("waaaa-waaaa-waaaa\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Failed to generate"):
+        phrases.generate_unique_phrase(phrases_path=phrases_path, words_path=words_path)
+
+
+def test_generate_phrase_format_pattern(tmp_path: Path) -> None:
+    words_path = tmp_path / "words.txt"
+    _write_dictionary(words_path, size=1000)
+    phrases_path = tmp_path / "phrases.txt"
+    phrase = phrases.generate_unique_phrase(phrases_path=phrases_path, words_path=words_path)
+    assert re.fullmatch(r"[a-z]+-[a-z]+-[a-z]+", phrase), f"Phrase {phrase!r} doesn't match expected pattern"
+
+
+def test_load_existing_phrases_missing_file() -> None:
+    assert phrases._load_existing_phrases(Path("/nonexistent/path/to/phrases.txt")) == set()
+
+
+def test_load_words_unicode_alpha_included(tmp_path: Path) -> None:
+    dictionary = tmp_path / "dict.txt"
+    dictionary.write_text("cafe\n\u00fcber\n123\na b\n", encoding="utf-8")
+    result = phrases._load_words(dictionary)
+    assert "cafe" in result
+    assert "\u00fcber" in result
