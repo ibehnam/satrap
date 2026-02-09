@@ -1,3 +1,88 @@
+"""Git operations and worktree management for Satrap.
+
+This module provides two implementations with the same public surface:
+
+- `GitClient`: the real implementation that shells out to `git` via `subprocess`.
+- `DryRunGitClient`: a no-op implementation used by `--dry-run` / smoke tests to avoid
+  mutating git state while still exercising higher-level orchestration logic.
+
+The core data model is:
+
+- `GitWorktree`: an immutable `(branch, path)` pair describing where a given branch is
+  checked out on disk.
+
+GitClient API (public methods)
+All methods are intentionally small and map closely to a single git command, so callers
+can reason about side effects.
+
+- `current_branch(cwd=...) -> str`
+  Returns the current branch name for the repository/worktree at `cwd`. Raises
+  `RuntimeError` if `HEAD` is detached (Satrap expects to run from a named branch).
+- `ensure_worktree(branch, base_ref, worktrees_dir, phrases_path) -> GitWorktree`
+  Ensures there is a git worktree for `branch`. If `branch` already has an associated
+  worktree (as reported by `worktrees()`), it is reused. Otherwise:
+  1) `worktrees_dir` is created if missing.
+  2) A unique directory name ("phrase") is allocated via `generate_unique_phrase()`,
+     backed by `phrases_path` (a ledger to avoid collisions/reuse).
+  3) A worktree is created at `worktrees_dir/<phrase>`:
+     - If `branch` already exists locally: `git worktree add <path> <branch>`
+     - Else: `git worktree add -b <branch> <path> <base_ref>`
+- `worktrees() -> dict[str, Path]`
+  Parses `git worktree list --porcelain` and returns a mapping of local branch name (e.g.
+  `main`) to absolute worktree path. Only `refs/heads/*` entries are included.
+- `branch_exists(branch) -> bool`
+  Checks whether `refs/heads/<branch>` exists (local branch).
+- `merge_base(branch, other_ref, cwd=...) -> str`
+  Returns the merge base commit SHA between `branch` and `other_ref`.
+- `diff_since(base_commit, cwd=...) -> str`
+  Returns the unified diff between `base_commit` and `HEAD` in the given worktree.
+- `commits_since(base_commit, cwd=...) -> list[str]`
+  Returns commit SHAs (oldest to newest) between `base_commit` (exclusive) and `HEAD`.
+- `commit_all_if_needed(cwd=..., message=...) -> None`
+  If the worktree has changes (`git status --porcelain`), stages everything (`git add -A`)
+  and attempts a commit with the provided message.
+- `reset_hard(ref, cwd=...) -> None`
+  Runs `git reset --hard <ref>`. This is destructive by design and is intended for
+  cleaning up failed worker attempts.
+- `merge_into(source_branch, target_branch, cwd=...) -> None`
+  Merges `source_branch` into the currently checked out branch in the `cwd` worktree using
+  a merge commit for traceability (`--no-ff --no-edit`). The `target_branch` parameter is
+  informational: the caller is expected to run this inside the target worktree with
+  `target_branch` checked out.
+
+Worktree strategy
+Satrap isolates work by creating (or reusing) a dedicated git worktree per branch under a
+caller-specified `worktrees_dir` (typically a generated/ignored directory such as
+`.worktrees/`). New worktree directories are named using a unique phrase drawn from a
+shared ledger (`phrases_path`, typically `phrases.txt`) to reduce collisions and keep
+paths human-readable.
+
+`ensure_worktree()` is idempotent with respect to branch names: if a worktree already
+exists for the branch, it returns the existing path rather than creating another.
+
+Side effects and safety notes
+- `GitClient` executes external commands (`git`) and will mutate the repository in methods
+  like `ensure_worktree()`, `commit_all_if_needed()`, `reset_hard()`, and `merge_into()`.
+- Most git invocations go through `_git(...)`, which uses `check=True` and will raise
+  `subprocess.CalledProcessError` on failure. Callers should expect and handle these
+  exceptions at higher levels.
+- `commit_all_if_needed()` intentionally uses `check=False` for the final `git commit`, so
+  a failed commit (e.g. hooks, missing identity, or no-op commit) will not raise.
+- `reset_hard()` discards uncommitted work; only call it on a worktree you are willing to
+  wipe.
+- `DryRunGitClient` does not touch git state and returns placeholder values (e.g. branch
+  `"dryrun"`, merge base `"DRYRUN"`, empty diffs/commit lists). Its `ensure_worktree()`
+  returns the `control_root` path, meaning there is no filesystem isolation in dry-run
+  mode; higher-level code must treat dry-run outputs as approximations rather than an
+  exact simulation of git behavior.
+
+Terminology:
+- `control_root` is the repository root where Satrap anchors operations like worktree
+  creation and `git worktree list`.
+- `cwd` is the working directory (usually a specific worktree) in which a command should
+  run; callers are responsible for passing the correct worktree path for the operation.
+"""
+
 from __future__ import annotations
 
 import subprocess

@@ -1,3 +1,123 @@
+"""satrap.agents
+
+This module defines the "agent backend" protocols used by the orchestrator and provides
+two sets of implementations:
+
+- Stub backends: deterministic/no-op implementations used by `--dry-run`.
+- External backends: implementations that shell out to external CLIs (currently the Claude
+  Code CLI) for planning, working, and verification.
+
+The goal is to keep orchestration logic (`satrap/orchestrator.py`) independent from any
+particular AI provider/CLI by programming to small, explicit protocols.
+
+Protocols and data models
+- PlannerBackend.plan(prompt_file, schema_file, step_number) -> PlannerResult
+  Returns a plan title (optional) and a list of TodoItemSpec describing the immediate
+  children for either the root task (step_number=None) or a specific step. The prompt is
+  read from `prompt_file`. The JSON schema at `schema_file` is used only by external
+  planners to request/validate structured output.
+  Note: `step_number` is included for interface symmetry; the external planner does not
+  use it directly (it is encoded into the prompt via rendering).
+
+- WorkerBackend.spawn(tier, prompt_file, cwd) -> WorkerRun
+  Starts an implementation attempt for a specific model tier (a list of model identifiers,
+  where tier[0] is the chosen model) in the given working directory.
+
+- WorkerBackend.watch(run) -> WorkerOutcome
+  Waits for the worker run to finish and returns an exit code and optional note. The
+  orchestrator uses the exit code to decide whether to retry with a higher tier and
+  whether to reset git state.
+
+- VerifierBackend.verify(prompt_file, diff, commits, step) -> VerificationResult
+  Returns pass/fail and an optional note explaining failure. The verifier prompt is
+  expected to contain the step context plus diff/commit metadata (rendered in
+  `satrap/render.py`).
+
+WorkerTier
+- `WorkerTier` is `list[str]`. The orchestrator passes tiers like `["ccss-haiku"]`,
+  `["ccss-sonnet"]`, etc. ExternalWorkerBackend picks `tier[0]` (or a default) to select
+  the CLI model. This intentionally keeps the tier abstraction minimal so it can later
+  encode richer routing (fallbacks, provider+model, etc.).
+
+Stub vs external implementations
+- StubPlannerBackend: returns a fixed small plan for root planning and a single atomic
+  item for per-step planning. It is deterministic and does not read the prompt or schema
+  beyond accepting the parameters.
+- StubWorkerBackend: does not execute anything; it returns exit_code=0 so that `--dry-run`
+  can exercise orchestration without mutating git state.
+- StubVerifierBackend: always passes.
+
+- ExternalPlannerBackend / ExternalVerifierBackend: invoke `run_claude_json_from_files`
+  (`satrap/claude_cli.py`) which runs the Claude Code CLI with:
+  - `--json-schema <compacted schema>`
+  - `--output-format json`
+  The schema is compacted via `jq -c . <schema_file>` (so `jq` is required). The CLI
+  output is parsed from the final "result" event and prefers the `structured_output`
+  field when present.
+
+- ExternalWorkerBackend: invokes the CLI in "prompt mode" (`-p <prompt>`) without
+  structured JSON output. It is treated as an interactive/streaming subprocess.
+
+High-level orchestration data flow (how this module is used)
+1. The orchestrator renders prompts into `.satrap/renders/` via `satrap/render.py`. The
+   rendered prompt includes a todo view, role-specific instructions, and optionally the
+   Satrap lessons section from `tasks/lessons.md`.
+2. Planning phase:
+   - Orchestrator calls PlannerBackend.plan(...) with the planner prompt file and
+     `todo-schema.json`.
+   - ExternalPlannerBackend expects a JSON object with an `items` array. Items are parsed
+     into TodoItemSpec via `_parse_todo_item_spec`, which trims strings and defensively
+     validates types.
+   - The orchestrator writes the resulting plan into `.satrap/todo.json`, which is the
+     single source of truth for step status and structure.
+3. Implementation phase:
+   - Orchestrator creates/ensures a git worktree for the step and calls WorkerBackend.spawn(...)
+     followed by WorkerBackend.watch(...).
+   - If the worker exits non-zero, the orchestrator records a lesson and resets the step
+     worktree to the merge base before retrying the next tier.
+   - If the worker exits zero, the orchestrator commits any changes and proceeds to verification.
+4. Verification phase:
+   - Orchestrator builds a verifier prompt (including diff and commit list) and calls
+     VerifierBackend.verify(...).
+   - If verification fails, the orchestrator records a lesson and resets the worktree to
+     the merge base, then retries the next tier.
+
+Important behaviors and gotchas
+- Subprocess streaming (worker):
+  ExternalWorkerBackend streams both stdout and stderr line-by-line to the parent process
+  using `selectors`. This is "live" but relies on newline-terminated lines. `bufsize=1`
+  is used with text mode, but line-buffering is not guaranteed when stdout/stderr are
+  pipes; the child must flush for truly real-time output.
+- Subprocess streaming (planner/verifier):
+  `run_claude_json_from_files` intentionally does not stream stdout live because
+  `--output-format json` can produce a large JSON "envelope". Instead it buffers stdout,
+  streams stderr (so progress/errors still appear), then prints a normalized payload
+  after extracting the final result.
+- Structured output extraction and parsing:
+  Claude Code CLI output is treated as an "envelope" that may be either a single JSON
+  value (commonly an array of events) or JSONL. The extractor prefers `structured_output`
+  from the final `type=="result"` event; otherwise it falls back to parsing the printed
+  `result` string best-effort.
+- Error handling semantics:
+  - ExternalPlannerBackend / ExternalVerifierBackend raise on non-zero CLI exit or invalid
+    JSON shape; the orchestrator currently does not wrap these in recovery, so a
+    planner/verifier failure aborts the run.
+  - ExternalWorkerBackend returns an exit code; the orchestrator uses that to retry tiers
+    and reset git state. Worker failures should generally be expressed as a non-zero exit
+    (not exceptions) so the tier fallback logic can run.
+- Backend-specific state:
+  WorkerRun.opaque carries backend-specific handles (e.g., the subprocess object) so the
+  orchestrator can remain backend-agnostic. Any new WorkerBackend should treat `opaque` as
+  private and ensure `watch()` can interpret what `spawn()` stores.
+
+Extending
+To add a new provider/CLI, implement the relevant Protocol(s) and keep the same semantics:
+- Planner/Verifier should return parsed Python objects (PlannerResult / VerificationResult)
+  and raise on unrecoverable errors.
+- Worker should stream or capture output as appropriate, return a stable exit code, and
+  keep backend-specific handles inside WorkerRun.opaque.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

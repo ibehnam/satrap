@@ -1,3 +1,93 @@
+"""Satrap orchestrator: plan -> work -> verify -> merge, driven by a single JSON todo document.
+
+This module coordinates three agent roles (planner, worker, verifier) and git worktrees to
+execute a hierarchical task plan stored in `.satrap/todo.json`. The orchestrator is designed
+to be restartable: it persists state transitions to the todo file and uses stable branch names
+so interrupted runs can be resumed.
+
+Lifecycle
+1. Plan
+  - If the todo file does not exist, initialize it with a title/context and an empty `items` list.
+  - If running from the root (no `--step`), ensure the root plan exists:
+    - If `todo.items` is empty, call the planner to produce top-level items.
+  - If running a specific step, ensure that step is planned:
+    - If the step already has children, do not re-plan.
+    - Otherwise, call the planner to refine it:
+      - If the planner returns exactly 1 item, treat it as an atomic refinement: update the step's
+        fields and clear `children`.
+      - If the planner returns >1 items, treat them as child steps and upsert them under the parent.
+
+2. Work (implementation)
+  - Steps are executed in dependency order using `dependency_batches(...)` over each level's items.
+  - For each step that is not `done` or `blocked`, mark it `doing` immediately in `.satrap/todo.json`
+    (the todo file is the single source of truth for progress).
+  - Two execution modes exist:
+    - Atomic step (no children): implement directly on the step branch, potentially retrying with
+      progressively stronger worker "tiers" if verification fails.
+    - Non-atomic step (has children): recurse into children in dependency order and merge each child
+      back into the parent step branch; when all children are done, merge the parent step branch up.
+
+3. Verify (atomic steps only, currently)
+  - For atomic steps, compute `base_commit = merge-base(step_branch, parent_branch)` and run the worker
+    in the step worktree. After a successful worker run:
+    - Commit any uncommitted changes with a traceable message (`satrap: <step> <summary>`).
+    - Build the verifier input from the diff and commit list since `base_commit`.
+    - If the verifier rejects, append a lesson entry and `git reset --hard base_commit` to discard the
+      attempt before trying the next tier.
+  - If all tiers fail verification, the step is marked `blocked` with a human-readable reason and the
+    verifier/worker notes are appended to `tasks/lessons.md`.
+
+4. Merge
+  - When a step is accepted (or when a non-atomic step's children are complete), merge the step branch
+    into its parent branch via `git merge --no-ff --no-edit` in the parent worktree, then mark the step
+    `done` in `.satrap/todo.json`.
+  - Project-level "verify everything then merge satrap/root into the user's base branch" is currently a
+    placeholder; today, the run ends after executing/merging steps into `satrap/root`.
+
+Todo state transitions
+`TodoStatus` is persisted in `.satrap/todo.json` and is the authoritative orchestration state:
+- `pending`: default for newly planned steps.
+- `doing`: set at step start, before any git/agent work begins.
+- `done`: set only after the step branch has been merged into its parent branch.
+- `blocked`: set only after exhausting all worker tiers for an atomic step (with `blocked_reason`).
+
+Notes:
+- Planner updates should be non-destructive to execution state: planning updates text/details/deps/
+  acceptance criteria and (up)serts children, while preserving existing statuses and any unknown
+  extra fields stored in the todo JSON.
+- `dependency_batches` treats missing dependency numbers as "not done" and raises on deadlock (cycles
+  or unmet prerequisites) rather than looping indefinitely.
+
+Worktree and branching scheme
+Satrap reserves the `satrap/` branch namespace and uses git worktrees for isolation:
+- Base branch: the branch Satrap is invoked from (must not be detached HEAD).
+- Root branch: `satrap/root`, created from the base branch and checked out into a worktree.
+- Step branches: `satrap/<number>` (e.g. `satrap/1`, `satrap/2.3`, `satrap/2.3.1`).
+- Parent selection:
+  - Top-level step `N` merges into `satrap/root`.
+  - Nested step `N.M...` merges into `satrap/N.M...`'s immediate ancestor branch
+    (e.g. `2.3.1` merges into `satrap/2.3`).
+- Worktree locations: `.worktrees/<unique-phrase>/` where the phrase is generated and recorded in
+  `phrases.txt` to avoid collisions and make worktree directories human-recognizable.
+- Worktree reuse: if a worktree for a branch already exists, Satrap reuses it; it does not implicitly
+  rebase or delete branches/worktrees.
+
+Key invariants (and current caveats)
+- Single source of truth: `.satrap/todo.json` is the control plane; Satrap persists status changes
+  immediately and frequently reloads the file to make scheduling decisions.
+- Merge discipline: merges are performed in the parent branch's worktree; step worktrees are for
+  implementation and verification inputs.
+- Atomic safety: every failed worker attempt for an atomic step is reset back to `base_commit` to
+  prevent accumulating partial changes across retries/tiers.
+- Verified-before-merge (atomic): an atomic step's changes are merged into its parent only after the
+  verifier returns `passed=true`.
+- Non-atomic caveat: aggregate verification of parent steps (those that only orchestrate children) is
+  currently a placeholder; such steps are considered complete once all children are `done` and the
+  branch is merged upward.
+- Reset/traceability: reinitializing the todo (via `--reset-todo` or when a previous plan is complete)
+  archives the prior file under `.satrap/todo-history/` best-effort before writing the new plan.
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime

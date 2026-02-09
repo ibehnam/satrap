@@ -1,3 +1,109 @@
+"""satrap.cli
+
+Command-line entrypoint for Satrap, a recursive orchestrator that:
+1) plans work into a structured todo tree,
+2) executes steps in isolated git worktrees/branches via an external "worker" CLI,
+3) verifies results via an external "verifier" CLI,
+4) updates `.satrap/todo.json` as the single source of truth for step status.
+
+Entry points
+- `satrap.cli:main`
+- `python3 -m satrap ...` (delegates to this module)
+
+Usage (conceptual)
+- `python3 -m satrap "do the thing"`
+- `python3 -m satrap path/to/task.txt`
+- `python3 -m satrap -` (read task text from stdin)
+
+Positional argument
+- `task`: Task input source.
+  - If `task == "-"`, reads UTF-8 from `/dev/stdin`.
+  - Else if `task` names an existing file, reads that file as UTF-8.
+  - Otherwise treats `task` as a literal task string.
+  Note: the task text is primarily used to initialize/reset the todo file; when a todo
+  already exists and matches the current task context, subsequent runs operate from that
+  persisted plan.
+
+Flags (surface area)
+- `--step <N>`: Start/resume from a specific todo step number (e.g. `2.3.1`) instead of
+  running the whole plan.
+- `--todo-json <path>`: Path to the todo JSON file (default: `.satrap/todo.json`).
+- `--reset-todo`: Overwrite the todo JSON with a fresh plan for the provided task input.
+  When resetting an existing todo, Satrap best-effort archives the previous file under
+  `.satrap/todo-history/todo-<timestamp>.json`.
+- `--schema-json <path>`: Path to the todo JSON schema passed to the planner backend
+  (default: `todo-schema.json`).
+- `--verifier-schema-json <path>`: Path to the verifier JSON schema file
+  (default: `verifier-schema.json`).
+- `--dry-run`: Smoke-test mode. Uses stub planner/worker/verifier backends and a no-op
+  git client (details below).
+- `--planner-cmd <exe>`: Planner CLI executable/command (default: `claude`).
+- `--worker-cmd <exe>`: Worker CLI executable (default: `claude`).
+- `--verifier-cmd <exe>`: Verifier CLI executable/command (default: `claude`).
+- `--worker-tiers <csv>`: Comma-separated "tier" list (low -> high), default
+  `ccss-haiku,ccss-sonnet,ccss-opus,ccss-default`. Each tier currently maps to a single
+  worker model name and is tried in order until verification passes.
+- `--max-parallel <int>`: Upper bound for parallel step execution when dependencies allow.
+  This is scaffolding; the current orchestrator runs batches sequentially but still stores
+  the value in config.
+
+Control root and path resolution
+Satrap operates relative to a "control root", which is:
+- `Path($SATRAP_CONTROL_ROOT).resolve()` when the `SATRAP_CONTROL_ROOT` environment variable
+  is set, otherwise
+- `Path.cwd().resolve()` at process start.
+
+The control root is used for:
+- Resolving CLI paths: `--todo-json`, `--schema-json`, and `--verifier-schema-json` are
+  resolved as `(control_root / <arg>).resolve()`, so relative paths are anchored at the
+  control root, and absolute paths bypass it.
+- Files/directories the orchestrator reads/writes:
+  - `.satrap/todo.json` and `.satrap/todo-history/` (todo state and archives)
+  - `.satrap/renders/` (rendered planner/worker/verifier prompts)
+  - `tasks/lessons.md` (verifier/worker failure notes)
+  - `phrases.txt` (worktree-name uniqueness ledger)
+  - `.worktrees/` (git worktree directories)
+- Git operations: the git client is constructed with `control_root` and runs git commands
+  with `cwd=control_root`.
+
+How CLI args map to config/backends
+`main()` wires parsed arguments into `SatrapConfig` as follows:
+- `control_root` is derived from `SATRAP_CONTROL_ROOT` / `cwd`.
+- `todo_json_path` = resolved `--todo-json`
+- `todo_schema_path` = resolved `--schema-json` (passed to planner)
+- `model_tiers` = `--worker-tiers` split on commas; each tier becomes `[tier]` and the
+  worker uses the first element as the model name.
+- `max_parallel` = `max(1, --max-parallel)`
+- Backends are selected based on `--dry-run`:
+  Non-dry-run ("real") backends:
+  - Planner: `ExternalPlannerBackend(cmd=--planner-cmd)` runs a schema-validated JSON
+    planning call (currently via Claude Code with a fixed model) and uses `jq` to compact
+    the JSON schema before passing it to the planner CLI.
+  - Worker: `ExternalWorkerBackend(cmd=--worker-cmd)` spawns the worker CLI in the step
+    worktree directory using the selected tier model; it passes the rendered prompt via
+    `-p` and includes `--dangerously-skip-permissions`.
+  - Verifier: `ExternalVerifierBackend(cmd=--verifier-cmd, schema_file=verifier_schema_json)`
+    runs a schema-validated JSON verification call (currently via Claude Code with a fixed
+    model) and expects `{ "passed": <bool>, "note": <optional str> }`.
+  - Git: `GitClient(control_root=control_root)` manages branches/worktrees and merging.
+  Dry-run backends:
+  - Planner: `StubPlannerBackend()` returns deterministic placeholder steps.
+  - Worker: `StubWorkerBackend()` is a no-op that exits successfully.
+  - Verifier: `StubVerifierBackend()` always passes.
+  - Git: `DryRunGitClient(control_root=control_root)` performs no git operations and
+    returns the control root as the "worktree" path.
+
+Dry-run semantics
+`--dry-run` is intended as a smoke test of orchestration wiring and file/path behavior:
+- No external CLIs are invoked (no `git`, no planner/worker/verifier executables, no `jq`).
+- No git state is mutated (no branches/worktrees/commits/merges).
+- The orchestrator still reads/writes control-root files:
+  - It creates/updates `.satrap/todo.json` and may archive prior todos on reset.
+  - It writes rendered prompts under `.satrap/renders/`.
+  - It advances todo step statuses (e.g., PENDING -> DOING -> DONE) as if steps ran, even
+    though no repository changes are produced by the stub worker.
+"""
+
 from __future__ import annotations
 
 import argparse
