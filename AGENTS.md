@@ -4,7 +4,7 @@
 
 - `satrap/`: Python package and CLI entrypoints (`satrap.cli:main`, `python3 -m satrap`).
 - `tasks/`: Human-maintained notes (`tasks/todo.md`, `tasks/lessons.md`).
-- `todo.json`: Single source of truth for the orchestration plan and step status.
+- `.satrap/todo.json`: Single source of truth for the orchestration plan and step status.
 - `todo-schema.json`, `verifier-schema.json`: JSON Schemas used for structured planner/verifier output.
 - `phrases.txt`: Phrase uniqueness ledger used when creating git worktrees.
 - Generated (ignored): `.worktrees/` (git worktrees), `.satrap/` (rendered prompts), `__pycache__/`.

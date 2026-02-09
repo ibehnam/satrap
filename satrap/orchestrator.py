@@ -53,7 +53,7 @@ class SatrapOrchestrator:
     def run(self, *, task_text: str, start_step: str | None, reset_todo: bool = False) -> None:
         """Entry point for the CLI.
 
-        `task_text` is only used to initialize `todo.json` when it does not exist.
+        `task_text` is only used to initialize the todo file when it does not exist.
         """
         todo = self._load_or_init_todo(task_text=task_text, reset_todo=reset_todo)
         print(f"[satrap] todo: {self.cfg.todo_json_path}", file=sys.stderr)
@@ -278,7 +278,7 @@ class SatrapOrchestrator:
             if reset_todo or (incoming and incoming != existing):
                 if not reset_todo and (not todo.is_complete()) and todo.items:
                     raise RuntimeError(
-                        "todo.json already exists for a different task and is not complete. "
+                        "todo file already exists for a different task and is not complete. "
                         "Use --reset-todo to overwrite, or pass --todo-json to use a separate file."
                     )
 

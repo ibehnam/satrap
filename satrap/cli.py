@@ -40,8 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--todo-json",
-        default="todo.json",
-        help="Path to the single source of truth todo JSON (default: ./todo.json).",
+        default=".satrap/todo.json",
+        help="Path to the single source of truth todo JSON (default: ./.satrap/todo.json).",
     )
     p.add_argument(
         "--reset-todo",

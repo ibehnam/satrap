@@ -1,7 +1,7 @@
 # satrap scaffolding
 
 ## Plan
-- [x] Define on-disk contract: `todo.json` (single source of truth), `todo-schema.json`, `satrap/phrases.txt`, `satrap/lessons.md`, and generated render files under `.satrap/`.
+- [x] Define on-disk contract: `.satrap/todo.json` (single source of truth), `todo-schema.json`, `satrap/phrases.txt`, `satrap/lessons.md`, and generated render files under `.satrap/`.
 - [x] Update `todo-schema.json` to include `details` (required for path-aware rendering).
 - [x] Implement Python package + CLI entrypoint (`python -m satrap ...`).
 - [x] Implement core todo operations: load/save, find-by-number, merge children, dependency scheduling, path-aware rendering.
@@ -17,7 +17,7 @@
 - [x] Make Claude structured output reliable: run planner/verifier with `--output-format json`, extract the final `result`, then parse JSON.
 
 ## Notes
-- Keep orchestration “one source of truth”: all status/children updates go through `todo.json`.
+- Keep orchestration “one source of truth”: all status/children updates go through `.satrap/todo.json`.
 - Rendering shows all `text` in-scope, but only `details` and `done_when` along the active path (and always shows `done_when` for the current step).
 
 ## Results
@@ -32,11 +32,11 @@
 
 ### Plan
 - [x] Make tmux behavior match spec: worker attempts run in a new tmux pane per step worktree and panes remain visible after exit.
-- [x] Prevent "satrap did nothing" on a new task: reset/replace `todo.json` when task input changes, with archival history under `.satrap/todo-history/`.
+- [x] Prevent "satrap did nothing" on a new task: reset/replace `.satrap/todo.json` when task input changes, with archival history under `.satrap/todo-history/`.
 - [x] Improve observability: always print which `todo.json` is loaded, whether it's complete, and when satrap is exiting because there's nothing to do.
 - [x] Verify locally with `--no-tmux --dry-run` that reset and logging work; then verify in tmux manually that panes show worker output.
 
 ### Results
 - [x] Worker attempts now run in per-step worktree tmux panes (remain visible after exit) instead of only running in the top-level satrap pane.
-- [x] `todo.json` now resets when task input changes and the previous plan is complete (or when forced via `--reset-todo`), with archival copies under `.satrap/todo-history/`.
+- [x] `.satrap/todo.json` now resets when task input changes and the previous plan is complete (or when forced via `--reset-todo`), with archival copies under `.satrap/todo-history/`.
 - [x] Satrap now prints explicit diagnostics about which `todo.json` is loaded, its context, and whether it is exiting because all steps are already done.

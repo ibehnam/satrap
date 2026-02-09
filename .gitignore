@@ -10,4 +10,8 @@
 .opencode
 __pycache__/
 .worktrees/
-.satrap/
+.satrap/*
+!.satrap/todo.json
+.satrap/renders/
+.satrap/runs/
+.satrap/todo-history/

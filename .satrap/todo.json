@@ -1,0 +1,30 @@
+{
+  "title": "(stub) Plan",
+  "items": [
+    {
+      "number": "1",
+      "text": "(stub) Implement step 1",
+      "status": "done",
+      "depends_on": [],
+      "done_when": [
+        "(stub) The step's acceptance criteria are met."
+      ],
+      "children": [],
+      "details": "(stub) This is an atomic step: 1"
+    },
+    {
+      "number": "2",
+      "text": "(stub) Implement step 2",
+      "status": "done",
+      "depends_on": [
+        "1"
+      ],
+      "done_when": [
+        "(stub) The step's acceptance criteria are met."
+      ],
+      "children": [],
+      "details": "(stub) This is an atomic step: 2"
+    }
+  ],
+  "context": "smoke"
+}
