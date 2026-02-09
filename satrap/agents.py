@@ -125,7 +125,15 @@ from pathlib import Path
 from typing import Protocol
 
 from .claude_cli import run_claude_json_from_files
-from .tmux import ensure_window, in_tmux, shell_argv, spawn_pane_remain_on_exit, wait_for
+from .tmux import (
+    PaneContext,
+    ensure_window,
+    in_tmux,
+    send_command,
+    shell_argv,
+    spawn_pane_remain_on_exit,
+    wait_for,
+)
 from .todo import TodoItem, TodoItemSpec
 
 WorkerTier = list[str]
@@ -144,23 +152,53 @@ class VerificationResult:
 
 
 class PlannerBackend(Protocol):
-    def plan(self, *, prompt_file: Path, schema_file: Path, step_number: str | None) -> PlannerResult: ...
+    def plan(
+        self,
+        *,
+        prompt_file: Path,
+        schema_file: Path,
+        step_number: str | None,
+        pane: PaneContext | None = None,
+    ) -> PlannerResult: ...
 
 
 class WorkerBackend(Protocol):
-    def spawn(self, *, tier: WorkerTier, prompt_file: Path, cwd: Path) -> "WorkerRun": ...
+    def spawn(
+        self,
+        *,
+        tier: WorkerTier,
+        prompt_file: Path,
+        cwd: Path,
+        pane: PaneContext | None = None,
+    ) -> "WorkerRun": ...
 
     def watch(self, run: "WorkerRun") -> "WorkerOutcome": ...
 
 
 class VerifierBackend(Protocol):
-    def verify(self, *, prompt_file: Path, diff: str, commits: list[str], step: TodoItem) -> VerificationResult: ...
+    def verify(
+        self,
+        *,
+        prompt_file: Path,
+        diff: str,
+        commits: list[str],
+        step: TodoItem,
+        pane: PaneContext | None = None,
+    ) -> VerificationResult: ...
 
 
 class StubPlannerBackend:
     """Deterministic planner for `--dry-run`."""
 
-    def plan(self, *, prompt_file: Path, schema_file: Path, step_number: str | None) -> PlannerResult:
+    def plan(
+        self,
+        *,
+        prompt_file: Path,
+        schema_file: Path,
+        step_number: str | None,
+        pane: PaneContext | None = None,
+    ) -> PlannerResult:
+        _ = (prompt_file, schema_file, pane)
         if step_number is None:
             return PlannerResult(
                 title="(stub) Plan",
@@ -196,7 +234,14 @@ class StubPlannerBackend:
 class StubWorkerBackend:
     """No-op worker for `--dry-run`."""
 
-    def spawn(self, *, tier: WorkerTier, prompt_file: Path, cwd: Path) -> "WorkerRun":
+    def spawn(
+        self,
+        *,
+        tier: WorkerTier,
+        prompt_file: Path,
+        cwd: Path,
+        pane: PaneContext | None = None,
+    ) -> "WorkerRun":
         return WorkerRun(tier=tier, prompt_file=prompt_file, cwd=cwd)
 
     def watch(self, run: "WorkerRun") -> "WorkerOutcome":
@@ -206,7 +251,16 @@ class StubWorkerBackend:
 class StubVerifierBackend:
     """Always-pass verifier for `--dry-run`."""
 
-    def verify(self, *, prompt_file: Path, diff: str, commits: list[str], step: TodoItem) -> VerificationResult:
+    def verify(
+        self,
+        *,
+        prompt_file: Path,
+        diff: str,
+        commits: list[str],
+        step: TodoItem,
+        pane: PaneContext | None = None,
+    ) -> VerificationResult:
+        _ = (prompt_file, diff, commits, step, pane)
         return VerificationResult(passed=True, note=None)
 
 
@@ -215,13 +269,23 @@ class ExternalPlannerBackend:
         self.cmd = cmd or "claude"
         self.model = "ccss-sonnet"
 
-    def plan(self, *, prompt_file: Path, schema_file: Path, step_number: str | None) -> PlannerResult:
+    def plan(
+        self,
+        *,
+        prompt_file: Path,
+        schema_file: Path,
+        step_number: str | None,
+        pane: PaneContext | None = None,
+    ) -> PlannerResult:
+        _ = (step_number, pane)
         res = run_claude_json_from_files(
             executable=self.cmd,
             model=self.model,
             prompt_file=prompt_file,
             schema_file=schema_file,
             cwd=schema_file.parent,
+            pane=pane,
+            run_cwd=(pane.worktree_path if pane is not None else schema_file.parent),
         )
         if res.exit_code != 0:
             raise RuntimeError(f"Planner command failed with exit code {res.exit_code}: {res.stderr}")
@@ -267,7 +331,14 @@ class ExternalWorkerBackend:
         self.use_tmux_panes = use_tmux_panes
         self.tmux_window_name = tmux_window_name
 
-    def spawn(self, *, tier: WorkerTier, prompt_file: Path, cwd: Path) -> "WorkerRun":
+    def spawn(
+        self,
+        *,
+        tier: WorkerTier,
+        prompt_file: Path,
+        cwd: Path,
+        pane: PaneContext | None = None,
+    ) -> "WorkerRun":
         import subprocess
         import uuid
         import shlex
@@ -275,6 +346,30 @@ class ExternalWorkerBackend:
         model = tier[0] if tier else "ccss-sonnet"
         prompt = prompt_file.read_text(encoding="utf-8")
         argv = [self.cmd, "--model", model, "-p", prompt, "--dangerously-skip-permissions"]
+        if pane is not None and self.use_tmux_panes:
+            runs_dir = (self.control_root / ".satrap" / "runs").resolve()
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            run_id = uuid.uuid4().hex
+            exit_file = runs_dir / f"worker-{run_id}.exit"
+            wait_key = f"satrap-worker-{run_id}"
+
+            script = "\n".join(
+                [
+                    f"exit_file={shlex.quote(str(exit_file))}",
+                    f"wait_key={shlex.quote(wait_key)}",
+                    "trap 'code=$?; echo $code > \"$exit_file\"; tmux wait-for -S \"$wait_key\"' EXIT",
+                    " ".join(shlex.quote(a) for a in argv),
+                ]
+            )
+            send_command(pane_id=pane.pane_id, argv=shell_argv(script=script))
+            return WorkerRun(
+                tier=tier,
+                prompt_file=prompt_file,
+                cwd=cwd,
+                pane=pane,
+                opaque={"kind": "tmux", "pane_id": pane.pane_id, "wait_key": wait_key, "exit_file": str(exit_file)},
+            )
+
         if in_tmux() and self.use_tmux_panes:
             runs_dir = (self.control_root / ".satrap" / "runs").resolve()
             runs_dir.mkdir(parents=True, exist_ok=True)
@@ -282,10 +377,7 @@ class ExternalWorkerBackend:
             exit_file = runs_dir / f"worker-{run_id}.exit"
             wait_key = f"satrap-worker-{run_id}"
 
-            # Run the worker in its own pane, inside the worktree dir, and signal completion.
-            # We write the exit code to a file so the parent process can read it reliably.
             step_key = prompt_file.name
-            # "<step>-worker.md" where step uses "-" instead of "." (e.g. "1-2-worker.md").
             if step_key.endswith("-worker.md"):
                 step_key = step_key[: -len("-worker.md")]
             step_label = step_key.replace("-", ".")
@@ -294,7 +386,6 @@ class ExternalWorkerBackend:
                 [
                     f"exit_file={shlex.quote(str(exit_file))}",
                     f"wait_key={shlex.quote(wait_key)}",
-                    # Ensure the parent is always unblocked, even if the worker crashes early.
                     "trap 'code=$?; echo $code > \"$exit_file\"; tmux wait-for -S \"$wait_key\"' EXIT",
                     " ".join(shlex.quote(a) for a in argv),
                 ]
@@ -306,17 +397,18 @@ class ExternalWorkerBackend:
                 cwd=cwd,
                 title=f"{step_label} {model}",
                 env={"SATRAP_CONTROL_ROOT": str(self.control_root)},
-                select=True,
+                select=False,
             )
             return WorkerRun(
                 tier=tier,
                 prompt_file=prompt_file,
                 cwd=cwd,
+                pane=pane,
                 opaque={"kind": "tmux", "pane_id": pane_id, "wait_key": wait_key, "exit_file": str(exit_file)},
             )
 
         p = subprocess.Popen(argv, cwd=str(cwd), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1)
-        return WorkerRun(tier=tier, prompt_file=prompt_file, cwd=cwd, opaque={"kind": "proc", "p": p})
+        return WorkerRun(tier=tier, prompt_file=prompt_file, cwd=cwd, pane=pane, opaque={"kind": "proc", "p": p})
 
     def watch(self, run: "WorkerRun") -> "WorkerOutcome":
         import selectors
@@ -363,11 +455,15 @@ class ExternalWorkerBackend:
 
         while sel.get_map():
             for key, _ in sel.select(timeout=0.1):
-                line = key.fileobj.readline()
-                if line == "":
-                    sel.unregister(key.fileobj)
+                stream = key.fileobj
+                if not hasattr(stream, "readline"):
+                    sel.unregister(stream)
                     continue
-                if key.fileobj is stdout:
+                line = stream.readline()
+                if line == "":
+                    sel.unregister(stream)
+                    continue
+                if stream is stdout:
                     sys.stdout.write(line)
                     sys.stdout.flush()
                 else:
@@ -386,6 +482,7 @@ class WorkerRun:
     tier: WorkerTier
     prompt_file: Path
     cwd: Path
+    pane: PaneContext | None = None
     # Placeholder: keep backend-specific state here (e.g., subprocess handle, tmux pane id, etc.).
     opaque: object | None = None
 
@@ -402,13 +499,24 @@ class ExternalVerifierBackend:
         self.model = "ccss-sonnet"
         self.schema_file = schema_file
 
-    def verify(self, *, prompt_file: Path, diff: str, commits: list[str], step: TodoItem) -> VerificationResult:
+    def verify(
+        self,
+        *,
+        prompt_file: Path,
+        diff: str,
+        commits: list[str],
+        step: TodoItem,
+        pane: PaneContext | None = None,
+    ) -> VerificationResult:
+        _ = (diff, commits, step, pane)
         res = run_claude_json_from_files(
             executable=self.cmd,
             model=self.model,
             prompt_file=prompt_file,
             schema_file=self.schema_file,
             cwd=self.schema_file.parent,
+            pane=pane,
+            run_cwd=(pane.worktree_path if pane is not None else self.schema_file.parent),
         )
         if res.exit_code != 0:
             raise RuntimeError(f"Verifier command failed with exit code {res.exit_code}: {res.stderr}")

@@ -229,12 +229,145 @@ def test_main_tmux_autospawn_short_circuits_orchestrator(
     assert spawn_kwargs["cwd"] == tmp_path.resolve()
     assert spawn_kwargs["title"] == "satrap"
     assert spawn_kwargs["keep_pane"] is False
+    assert spawn_kwargs["select"] is True
     assert spawn_kwargs["env"] == {"SATRAP_CONTROL_ROOT": str(tmp_path.resolve())}
     assert spawn_kwargs["argv"][-1] == "--no-tmux"
 
 
+def test_spawn_pane_autoclose_script_waits_five_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import satrap.tmux as tmux
+
+    captured: dict[str, object] = {}
+
+    def fake_check_output(argv: list[str], text: bool = True) -> str:
+        captured["argv"] = argv
+        return "%99\n"
+
+    monkeypatch.setattr(tmux.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(tmux.subprocess, "run", lambda *args, **kwargs: None)
+
+    tmux.spawn_pane(
+        window_target="sess:satrap",
+        argv=["python3", "-m", "satrap", "--no-tmux"],
+        cwd=tmp_path,
+        title="satrap",
+        keep_pane=False,
+        select=False,
+    )
+
+    split_argv = captured["argv"]
+    assert isinstance(split_argv, list)
+    script = split_argv[-1]
+    assert "sleep 5; tmux kill-pane -t $TMUX_PANE" in script
+
+
+def test_main_tmux_autospawn_uses_same_window_even_when_already_in_target_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SATRAP_CONTROL_ROOT", str(tmp_path))
+    monkeypatch.setenv("SATRAP_TMUX_WINDOW", "satrap-window")
+    monkeypatch.setattr(cli, "in_tmux", lambda: True)
+    monkeypatch.setattr(cli, "current_window_name", lambda: "satrap-window")
+
+    calls: dict[str, object] = {}
+
+    def fake_ensure_window(*, window_name: str, cwd: Path) -> str:
+        calls["ensure_window"] = (window_name, cwd)
+        return "mysession:satrap-window"
+
+    def fake_spawn_pane(**kwargs: object) -> str:
+        calls["spawn_pane"] = kwargs
+        return "%1"
+
+    class GuardOrchestrator:
+        def __init__(self, cfg: object) -> None:  # pragma: no cover - defensive
+            raise AssertionError("orchestrator should not be constructed when tmux autospawn short-circuits")
+
+    monkeypatch.setattr(cli, "ensure_window", fake_ensure_window)
+    monkeypatch.setattr(cli, "spawn_pane", fake_spawn_pane)
+    monkeypatch.setattr(cli, "SatrapOrchestrator", GuardOrchestrator)
+
+    rc = cli.main(["task", "--kill-pane"])
+
+    assert rc == 0
+    assert calls["ensure_window"] == ("satrap-window", tmp_path.resolve())
+
+
+def test_main_tmux_autospawn_defaults_to_keep_when_no_kill_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SATRAP_CONTROL_ROOT", str(tmp_path))
+    monkeypatch.setenv("SATRAP_TMUX_WINDOW", "satrap-window")
+    monkeypatch.setattr(cli, "in_tmux", lambda: True)
+    monkeypatch.setattr(cli, "current_window_name", lambda: "other-window")
+
+    calls: dict[str, object] = {}
+
+    def fake_ensure_window(*, window_name: str, cwd: Path) -> str:
+        calls["ensure_window"] = (window_name, cwd)
+        return "mysession:satrap-window"
+
+    def fake_spawn_pane(**kwargs: object) -> str:
+        calls["spawn_pane"] = kwargs
+        return "%1"
+
+    class GuardOrchestrator:
+        def __init__(self, cfg: object) -> None:  # pragma: no cover - defensive
+            raise AssertionError("orchestrator should not be constructed when tmux autospawn short-circuits")
+
+    monkeypatch.setattr(cli, "ensure_window", fake_ensure_window)
+    monkeypatch.setattr(cli, "spawn_pane", fake_spawn_pane)
+    monkeypatch.setattr(cli, "SatrapOrchestrator", GuardOrchestrator)
+
+    rc = cli.main(["task"])
+
+    assert rc == 0
+    assert calls["spawn_pane"]["keep_pane"] is True
+    assert calls["spawn_pane"]["select"] is True
+
+
+def test_main_tmux_autospawn_keep_pane_flag_preserves_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SATRAP_CONTROL_ROOT", str(tmp_path))
+    monkeypatch.setenv("SATRAP_TMUX_WINDOW", "satrap-window")
+    monkeypatch.setattr(cli, "in_tmux", lambda: True)
+    monkeypatch.setattr(cli, "current_window_name", lambda: "other-window")
+
+    calls: dict[str, object] = {}
+
+    def fake_ensure_window(*, window_name: str, cwd: Path) -> str:
+        calls["ensure_window"] = (window_name, cwd)
+        return "mysession:satrap-window"
+
+    def fake_spawn_pane(**kwargs: object) -> str:
+        calls["spawn_pane"] = kwargs
+        return "%1"
+
+    class GuardOrchestrator:
+        def __init__(self, cfg: object) -> None:  # pragma: no cover - defensive
+            raise AssertionError("orchestrator should not be constructed when tmux autospawn short-circuits")
+
+    monkeypatch.setattr(cli, "ensure_window", fake_ensure_window)
+    monkeypatch.setattr(cli, "spawn_pane", fake_spawn_pane)
+    monkeypatch.setattr(cli, "SatrapOrchestrator", GuardOrchestrator)
+
+    rc = cli.main(["task", "--keep-pane"])
+
+    assert rc == 0
+    assert calls["spawn_pane"]["keep_pane"] is True
+    assert calls["spawn_pane"]["select"] is True
+
+
 def test_main_in_tmux_with_no_tmux_flag_runs_inline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("SATRAP_CONTROL_ROOT", str(tmp_path))
     monkeypatch.setattr(cli, "in_tmux", lambda: True)

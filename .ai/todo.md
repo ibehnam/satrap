@@ -90,3 +90,24 @@
 - [x] Used fake planner/worker/verifier/git backends and monkeypatched prompt writers to keep tests hermetic and avoid external CLI/tool invocations.
 - [x] Verification command: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_orchestrator.py -q`.
 - [x] Outcome: `17 passed in 0.06s`.
+
+## 2026-02-09: Per-Worktree Panes + Background-Safe UX
+
+### Plan
+- [x] Add orchestrator-managed worktree pane lifecycle map and deterministic per-step color tags.
+- [x] Add/extend tmux helpers for documented background split/send/wait/kill/capture behavior with no focus stealing.
+- [x] Route planner/worker/verifier execution through the step pane context with fallback behavior preserved.
+- [x] Trim noisy lifecycle logging and keep concise role/step/pane summaries in control pane output.
+- [x] Add/update tests for pane lifecycle, pane routing, no-focus behavior, and status/log expectations.
+- [x] Run full pytest suite plus weather dry-run smoke verification.
+
+### Results
+- [x] Implemented per-step pane lifecycle in `satrap/orchestrator.py`: create once, reuse per step, close on step completion and orchestrator exit (best-effort).
+- [x] Updated `satrap/tmux.py` with module docstring, detached pane creation by default (`-d`), pane context struct, send/wait/kill helpers, and color helpers.
+- [x] Routed planner/verifier structured runs and worker attempts through shared pane context when available while preserving non-pane fallback behavior.
+- [x] Updated CLI auto-spawn and worker fallback pane spawning to non-focus behavior (`select=False`).
+- [x] Replaced textual `[step|color]` tokens with ANSI-colored lifecycle labels in control output and retained concise lifecycle lines.
+- [x] Added/updated tests in `tests/test_orchestrator.py`, `tests/test_claude_cli.py`, and `tests/test_cli.py` for pane routing, pane opt-out, tmux JSON path, and no-focus spawn settings.
+- [x] Verification:
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q` -> `210 passed, 1 warning`
+  - `python3 -m satrap --dry-run --no-tmux --reset-todo "get the weather in dallas and toronto"` -> passes with colored lifecycle logs.

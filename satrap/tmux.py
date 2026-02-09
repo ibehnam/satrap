@@ -1,9 +1,36 @@
+"""tmux helpers for Satrap runtime orchestration.
+
+This module centralizes non-focus-stealing tmux operations used by Satrap:
+- detect tmux session presence,
+- ensure/create a target window,
+- create detached panes,
+- send commands to existing panes,
+- synchronize with `tmux wait-for`,
+- collect pane metadata, and
+- tear down panes when work is finished.
+
+Design constraints:
+- pane creation is detached by default (`split-window -d`),
+- callers must opt in to focus switching (`select=True`),
+- helpers are safe to use from control panes without stealing user focus.
+"""
+
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import shlex
 import subprocess
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class PaneContext:
+    pane_id: str
+    window_target: str
+    label: str
+    worktree_path: Path
+    color: str | None = None
 
 
 def in_tmux() -> bool:
@@ -30,6 +57,72 @@ def ensure_window(*, window_name: str, cwd: Path) -> str:
     return f"{session}:{window_name}"
 
 
+def _split_window_detached(*, window_target: str, argv: list[str], cwd: Path) -> str:
+    return subprocess.check_output(
+        [
+            "tmux",
+            "split-window",
+            "-d",
+            "-t",
+            window_target,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-c",
+            str(cwd),
+            *argv,
+        ],
+        text=True,
+    ).strip()
+
+
+def current_window_name() -> str:
+    """Return current tmux window name for this client."""
+    return subprocess.check_output(["tmux", "display-message", "-p", "#W"], text=True).strip()
+
+
+def pane_target(*, pane_id: str) -> str:
+    return subprocess.check_output(
+        ["tmux", "display-message", "-p", "-t", pane_id, "#{session_name}:#{window_name}.#{pane_index}"],
+        text=True,
+    ).strip()
+
+
+def set_pane_color(*, pane_id: str, color: str) -> None:
+    subprocess.run(["tmux", "set-option", "-pt", pane_id, "pane-border-style", f"fg={color}"], check=False)
+    subprocess.run(["tmux", "set-option", "-pt", pane_id, "pane-active-border-style", f"fg={color}"], check=False)
+
+
+def _set_pane_title(*, pane_id: str, title: str, select: bool) -> None:
+    if select:
+        subprocess.run(["tmux", "select-pane", "-t", pane_id, "-T", title], check=False)
+        return
+    # Keep focus on current pane while setting title.
+    subprocess.run(["tmux", "select-pane", "-d", "-t", pane_id, "-T", title], check=False)
+
+
+def spawn_worktree_pane(
+    *,
+    window_target: str,
+    cwd: Path,
+    title: str,
+    color: str | None = None,
+    select: bool = False,
+) -> str:
+    """Create a detached shell pane for a worktree execution context."""
+    pane_id = _split_window_detached(window_target=window_target, argv=[_login_shell(), "-l"], cwd=cwd)
+    subprocess.run(["tmux", "set-option", "-pt", pane_id, "remain-on-exit", "on"], check=False)
+    _set_pane_title(pane_id=pane_id, title=title, select=select)
+    if color:
+        set_pane_color(pane_id=pane_id, color=color)
+
+    if select:
+        subprocess.run(["tmux", "select-window", "-t", window_target], check=False)
+        subprocess.run(["tmux", "select-pane", "-t", pane_id], check=False)
+
+    return pane_id
+
+
 def spawn_pane(
     *,
     window_target: str,
@@ -38,7 +131,7 @@ def spawn_pane(
     title: str,
     env: dict[str, str] | None = None,
     keep_pane: bool = False,
-    select: bool = True,
+    select: bool = False,
 ) -> str:
     """Spawn a command in a new pane inside `window_target`.
 
@@ -51,29 +144,24 @@ def spawn_pane(
         cmd = f"env {env_prefix} {cmd}"
 
     if keep_pane:
-        # Keep an interactive shell open after the command exits so the pane doesn't disappear.
         shell = shlex.quote(_login_shell())
         script = f"{cmd}; code=$?; echo; echo \"[satrap] exited $code\"; exec {shell} -l"
     else:
-        script = f"{cmd}; code=$?; tmux kill-pane -t $TMUX_PANE; exit $code"
+        # Keep pane visible briefly so users can see terminal output before auto-close.
+        script = f"{cmd}; code=$?; sleep 5; tmux kill-pane -t $TMUX_PANE; exit $code"
 
-    pane_id = subprocess.check_output(
-        ["tmux", "split-window", "-t", window_target, "-P", "-F", "#{pane_id}", "-c", str(cwd), _login_shell(), "-lc", script],
-        text=True,
-    ).strip()
-
-    # Cosmetic: best-effort set pane title.
-    subprocess.run(["tmux", "select-pane", "-t", pane_id, "-T", title], check=False)
+    pane_id = _split_window_detached(
+        window_target=window_target,
+        argv=[_login_shell(), "-lc", script],
+        cwd=cwd,
+    )
+    _set_pane_title(pane_id=pane_id, title=title, select=select)
 
     if select:
         subprocess.run(["tmux", "select-window", "-t", window_target], check=False)
         subprocess.run(["tmux", "select-pane", "-t", pane_id], check=False)
 
     return pane_id
-
-
-def wait_for(*, key: str) -> None:
-    subprocess.check_call(["tmux", "wait-for", key])
 
 
 def spawn_pane_remain_on_exit(
@@ -83,27 +171,34 @@ def spawn_pane_remain_on_exit(
     cwd: Path,
     title: str,
     env: dict[str, str] | None = None,
-    select: bool = True,
+    select: bool = False,
 ) -> str:
-    """Spawn a command in a new pane and keep it visible after exit.
-
-    This uses per-pane `remain-on-exit` so the user can inspect output.
-    """
+    """Spawn a command in a new detached pane and keep it visible after exit."""
     env = env or {}
-    # tmux split-window takes a command argv (no shell parsing). If we want env vars, prefix with `env`.
     cmd_argv = (["env", *[f"{k}={v}" for k, v in env.items()]] + argv) if env else argv
 
-    pane_id = subprocess.check_output(
-        ["tmux", "split-window", "-t", window_target, "-P", "-F", "#{pane_id}", "-c", str(cwd), *cmd_argv],
-        text=True,
-    ).strip()
+    pane_id = _split_window_detached(window_target=window_target, argv=cmd_argv, cwd=cwd)
 
-    # Keep pane after the process exits (per-pane).
     subprocess.run(["tmux", "set-option", "-pt", pane_id, "remain-on-exit", "on"], check=False)
-    subprocess.run(["tmux", "select-pane", "-t", pane_id, "-T", title], check=False)
+    _set_pane_title(pane_id=pane_id, title=title, select=select)
 
     if select:
         subprocess.run(["tmux", "select-window", "-t", window_target], check=False)
         subprocess.run(["tmux", "select-pane", "-t", pane_id], check=False)
 
     return pane_id
+
+
+def send_command(*, pane_id: str, argv: list[str]) -> None:
+    """Send a command argv to an existing pane without switching focus."""
+    cmd = " ".join(shlex.quote(a) for a in argv)
+    subprocess.check_call(["tmux", "send-keys", "-t", pane_id, "-l", cmd])
+    subprocess.check_call(["tmux", "send-keys", "-t", pane_id, "Enter"])
+
+
+def wait_for(*, key: str) -> None:
+    subprocess.check_call(["tmux", "wait-for", key])
+
+
+def kill_pane(*, pane_id: str) -> None:
+    subprocess.run(["tmux", "kill-pane", "-t", pane_id], check=False)

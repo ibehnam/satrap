@@ -121,7 +121,7 @@ from .agents import (
 )
 from .git_ops import DryRunGitClient, GitClient
 from .orchestrator import SatrapConfig, SatrapOrchestrator
-from .tmux import ensure_window, in_tmux, spawn_pane
+from .tmux import current_window_name, ensure_window, in_tmux, spawn_pane
 
 
 def _read_task_input(arg: str) -> str:
@@ -232,14 +232,17 @@ def main(argv: list[str] | None = None) -> int:
     if in_tmux() and not args.no_tmux:
         print("[satrap] spawning tmux pane...", file=sys.stderr)
         window_name = os.environ.get("SATRAP_TMUX_WINDOW", "satrap")
+        _ = current_window_name()  # keep call for observability/tests; no focus decisions here
         window = ensure_window(window_name=window_name, cwd=control_root)
+        keep_pane = not bool(args.kill_pane)
         spawn_pane(
             window_target=window,
             argv=[sys.executable, "-m", "satrap", *raw_argv, "--no-tmux"],
             cwd=control_root,
             title="satrap",
             env={"SATRAP_CONTROL_ROOT": str(control_root)},
-            keep_pane=(not bool(args.kill_pane)),
+            keep_pane=keep_pane,
+            select=True,
         )
         return 0
 

@@ -46,13 +46,18 @@ Error-handling assumptions
 
 from __future__ import annotations
 
+import io
 import json
 import selectors
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import uuid
+
+from .tmux import PaneContext, send_command, shell_argv, wait_for
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,73 @@ class ClaudeJSONResult:
     data: Any | None
 
 
+def _run_claude_json_via_tmux(
+    *,
+    executable: str,
+    model: str,
+    prompt: str,
+    schema_str: str,
+    cwd: Path,
+    run_cwd: Path,
+    pane: PaneContext,
+) -> ClaudeJSONResult:
+    runs_dir = (cwd / ".satrap" / "runs").resolve()
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    run_id = uuid.uuid4().hex
+    wait_key = f"satrap-json-{run_id}"
+    code_file = runs_dir / f"json-{run_id}.code"
+    out_file = runs_dir / f"json-{run_id}.stdout"
+    err_file = runs_dir / f"json-{run_id}.stderr"
+
+    cmd = [
+        executable,
+        "--model",
+        model,
+        "-p",
+        prompt,
+        "--json-schema",
+        schema_str,
+        "--output-format",
+        "json",
+    ]
+    cmd_str = " ".join(shlex.quote(a) for a in cmd)
+    script = "\n".join(
+        [
+            f"cd {shlex.quote(str(run_cwd))}",
+            f"out_file={shlex.quote(str(out_file))}",
+            f"err_file={shlex.quote(str(err_file))}",
+            f"code_file={shlex.quote(str(code_file))}",
+            f"wait_key={shlex.quote(wait_key)}",
+            "set +e",
+            f"{cmd_str} >\"$out_file\" 2>\"$err_file\"",
+            "code=$?",
+            "printf '%s\n' \"$code\" > \"$code_file\"",
+            "tmux wait-for -S \"$wait_key\"",
+        ]
+    )
+    send_command(pane_id=pane.pane_id, argv=shell_argv(script=script))
+    wait_for(key=wait_key)
+
+    stdout = out_file.read_text(encoding="utf-8").strip() if out_file.exists() else ""
+    stderr = err_file.read_text(encoding="utf-8").strip() if err_file.exists() else ""
+    try:
+        code = int(code_file.read_text(encoding="utf-8").strip()) if code_file.exists() else 1
+    except Exception:
+        code = 1
+
+    if stderr:
+        sys.stderr.write(stderr + "\n")
+        sys.stderr.flush()
+
+    extracted = _extract_structured_or_printed_result(stdout)
+    normalized = extracted.print_text.strip()
+    if normalized:
+        sys.stdout.write(normalized + "\n")
+        sys.stdout.flush()
+
+    return ClaudeJSONResult(exit_code=code, stdout=normalized, stderr=stderr, data=extracted.data)
+
+
 def run_claude_json_from_files(
     *,
     executable: str = "claude",
@@ -70,6 +142,8 @@ def run_claude_json_from_files(
     prompt_file: Path,
     schema_file: Path,
     cwd: Path,
+    pane: PaneContext | None = None,
+    run_cwd: Path | None = None,
 ) -> ClaudeJSONResult:
     """Run Claude with `--json-schema "$(jq -c . schema_file)"` and parse JSON from stdout.
 
@@ -81,6 +155,17 @@ def run_claude_json_from_files(
     """
     prompt = prompt_file.read_text(encoding="utf-8")
     schema_str = _jq_compact_json(schema_file, cwd=cwd)
+
+    if pane is not None:
+        return _run_claude_json_via_tmux(
+            executable=executable,
+            model=model,
+            prompt=prompt,
+            schema_str=schema_str,
+            cwd=cwd,
+            run_cwd=(run_cwd or cwd),
+            pane=pane,
+        )
 
     # Ordering matters with Claude Code CLI: keep `--output-format json` at the end
     # (matching the documented `-p "<prompt>" ...` usage).
@@ -107,12 +192,16 @@ def run_claude_json_from_files(
     # We print a normalized payload after extracting the final result.
     while sel.get_map():
         for key, _ in sel.select(timeout=0.1):
-            line = key.fileobj.readline()
+            stream = key.fileobj
+            if not hasattr(stream, "readline"):
+                sel.unregister(stream)
+                continue
+            line = stream.readline()
             if line == "":
-                sel.unregister(key.fileobj)
+                sel.unregister(stream)
                 continue
 
-            if key.fileobj is p.stdout:
+            if stream is p.stdout:
                 out_chunks.append(line)
             else:
                 err_chunks.append(line)

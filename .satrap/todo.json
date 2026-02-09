@@ -26,5 +26,5 @@
       "details": "(stub) This is an atomic step: 2"
     }
   ],
-  "context": "smoke"
+  "context": "kill pane verification run"
 }

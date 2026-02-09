@@ -8,6 +8,7 @@ import satrap.orchestrator as orch_mod
 from satrap.agents import PlannerResult, VerificationResult, WorkerOutcome, WorkerRun
 from satrap.git_ops import GitWorktree
 from satrap.orchestrator import SatrapConfig, SatrapOrchestrator, _append_under_section
+from satrap.tmux import PaneContext
 from satrap.todo import TodoDoc, TodoItem, TodoItemSpec, TodoStatus
 
 
@@ -16,7 +17,14 @@ class FakePlannerBackend:
         self.plans = plans
         self.calls: list[dict[str, object]] = []
 
-    def plan(self, *, prompt_file: Path, schema_file: Path, step_number: str | None) -> PlannerResult:
+    def plan(
+        self,
+        *,
+        prompt_file: Path,
+        schema_file: Path,
+        step_number: str | None,
+        pane: object | None = None,
+    ) -> PlannerResult:
         self.calls.append({"prompt_file": prompt_file, "schema_file": schema_file, "step_number": step_number})
         if step_number not in self.plans:
             raise AssertionError(f"Unexpected planner call for step {step_number!r}")
@@ -29,8 +37,15 @@ class FakeWorkerBackend:
         self.spawn_calls: list[dict[str, object]] = []
         self.watch_calls: list[WorkerRun] = []
 
-    def spawn(self, *, tier: list[str], prompt_file: Path, cwd: Path) -> WorkerRun:
-        run = WorkerRun(tier=tier, prompt_file=prompt_file, cwd=cwd)
+    def spawn(
+        self,
+        *,
+        tier: list[str],
+        prompt_file: Path,
+        cwd: Path,
+        pane: PaneContext | None = None,
+    ) -> WorkerRun:
+        run = WorkerRun(tier=tier, prompt_file=prompt_file, cwd=cwd, pane=pane)
         self.spawn_calls.append({"tier": list(tier), "prompt_file": prompt_file, "cwd": cwd})
         return run
 
@@ -46,8 +61,18 @@ class FakeVerifierBackend:
         self._verdicts = list(verdicts)
         self.calls: list[dict[str, object]] = []
 
-    def verify(self, *, prompt_file: Path, diff: str, commits: list[str], step: TodoItem) -> VerificationResult:
-        self.calls.append({"prompt_file": prompt_file, "diff": diff, "commits": list(commits), "step": step.number})
+    def verify(
+        self,
+        *,
+        prompt_file: Path,
+        diff: str,
+        commits: list[str],
+        step: TodoItem,
+        pane: PaneContext | None = None,
+    ) -> VerificationResult:
+        self.calls.append(
+            {"prompt_file": prompt_file, "diff": diff, "commits": list(commits), "step": step.number, "pane": pane}
+        )
         if not self._verdicts:
             raise AssertionError("No verifier verdicts left")
         return self._verdicts.pop(0)
@@ -166,7 +191,7 @@ def test_run_root_flow_executes_batches_and_root_branch(monkeypatch: pytest.Monk
     ensured: list[str | None] = []
     run_calls: list[tuple[str, str, str]] = []
 
-    def fake_ensure_planned(*, todo: TodoDoc, step_number: str | None) -> None:
+    def fake_ensure_planned(*, todo: TodoDoc, step_number: str | None, pane: object | None = None) -> None:
         ensured.append(step_number)
 
     def fake_run_step(*, todo: TodoDoc, step_number: str, parent_branch: str, parent_wt: GitWorktree) -> None:
@@ -719,6 +744,59 @@ def test_implement_atomic_all_tiers_fail_blocks_step(tmp_path: Path, monkeypatch
     assert todo.get_item("1").status == TodoStatus.BLOCKED
     assert len(git.reset_calls) == 2
     assert git.merge_into_calls == []
+
+
+def test_worktree_pane_disabled_when_worker_backend_disables_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cfg = _make_cfg(tmp_path)
+    orch = SatrapOrchestrator(cfg)
+    monkeypatch.setattr(orch_mod, "in_tmux", lambda: True)
+    setattr(orch.cfg.worker_backend, "use_tmux_panes", False)
+
+    assert orch._worktree_panes_enabled() is False
+
+
+def test_implement_atomic_passes_pane_context_to_worker_and_verifier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    git = FakeGit(control_root=tmp_path, merge_base_value="basex", diff_value="d", commits_value=["c"])
+    worker = FakeWorkerBackend([WorkerOutcome(exit_code=0)])
+    verifier = FakeVerifierBackend([VerificationResult(passed=True)])
+    cfg = _make_cfg(tmp_path, git=git, worker=worker, verifier=verifier, model_tiers=[["t1"]])
+    todo = TodoDoc(title="t", context="ctx", items=[TodoItem(number="1", text="step", done_when=["done"])])
+
+    orch = SatrapOrchestrator(cfg)
+    monkeypatch.setattr(orch_mod, "write_agent_prompt", lambda **_: tmp_path / "worker-pane.md")
+    monkeypatch.setattr(orch_mod, "write_verifier_prompt", lambda **_: tmp_path / "verifier-pane.md")
+
+    step = todo.get_item("1")
+    step_wt = GitWorktree(branch="satrap/1", path=tmp_path / "wt-step-pane")
+    parent_wt = GitWorktree(branch="satrap/root", path=tmp_path / "wt-root-pane")
+    step_wt.path.mkdir(parents=True, exist_ok=True)
+    parent_wt.path.mkdir(parents=True, exist_ok=True)
+
+    pane = PaneContext(
+        pane_id="%88",
+        window_target="session:satrap",
+        label="1",
+        worktree_path=step_wt.path,
+        color="cyan",
+    )
+
+    orch._implement_atomic(
+        todo=todo,
+        step=step,
+        step_wt=step_wt,
+        parent_branch="satrap/root",
+        parent_wt=parent_wt,
+        pane=pane,
+    )
+
+    assert worker.watch_calls[0].pane == pane
+    assert verifier.calls[0]["pane"] == pane
 
 
 def test_ensure_planned_single_item_refinement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

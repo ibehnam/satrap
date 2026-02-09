@@ -10,6 +10,69 @@ import pytest
 import satrap.claude_cli as claude_cli
 
 
+def test_run_claude_json_from_files_tmux_path_uses_send_wait_and_parses_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    prompt_file = tmp_path / "prompt.md"
+    schema_file = tmp_path / "schema.json"
+    prompt_file.write_text("plan it", encoding="utf-8")
+    schema_file.write_text("{}", encoding="utf-8")
+
+    from satrap.tmux import PaneContext
+
+    pane = PaneContext(
+        pane_id="%55",
+        window_target="session:satrap",
+        label="1",
+        worktree_path=tmp_path,
+        color="green",
+    )
+
+    monkeypatch.setattr(claude_cli, "_jq_compact_json", lambda _schema, *, cwd: '{"type":"object"}')
+    monkeypatch.setattr("uuid.uuid4", lambda: SimpleNamespace(hex="abc123"))
+
+    calls: dict[str, object] = {}
+
+    def fake_send_command(*, pane_id: str, argv: list[str]) -> None:
+        calls["pane_id"] = pane_id
+        calls["argv"] = argv
+
+    def fake_wait_for(*, key: str) -> None:
+        calls["wait_key"] = key
+        runs_dir = (tmp_path / ".satrap" / "runs").resolve()
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (runs_dir / "json-abc123.stdout").write_text(
+            '[{"type":"result","structured_output":{"ok":true}}]\n',
+            encoding="utf-8",
+        )
+        (runs_dir / "json-abc123.stderr").write_text("warn\n", encoding="utf-8")
+        (runs_dir / "json-abc123.code").write_text("0\n", encoding="utf-8")
+
+    monkeypatch.setattr(claude_cli, "send_command", fake_send_command)
+    monkeypatch.setattr(claude_cli, "wait_for", fake_wait_for)
+
+    out = claude_cli.run_claude_json_from_files(
+        executable="claude",
+        model="ccss-sonnet",
+        prompt_file=prompt_file,
+        schema_file=schema_file,
+        cwd=tmp_path,
+        pane=pane,
+        run_cwd=tmp_path / "nested-worktree",
+    )
+
+    sent_argv = calls["argv"]
+    assert isinstance(sent_argv, list)
+    assert str(tmp_path / "nested-worktree") in sent_argv[2]
+    assert calls["pane_id"] == "%55"
+    assert calls["wait_key"] == "satrap-json-abc123"
+    assert out.exit_code == 0
+    assert out.data == {"ok": True}
+    assert out.stdout == '{\n  "ok": true\n}'
+
+
+
 def test_parse_envelope_supports_json_and_jsonl_fallback() -> None:
     direct = '[{"type":"result","result":"ok"}]'
     assert claude_cli._parse_envelope(direct) == [{"type": "result", "result": "ok"}]

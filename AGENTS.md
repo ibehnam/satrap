@@ -118,3 +118,5 @@ pip install -e .
 
 - External CLIs used by default: `git`, `jq`, `claude`; tmux is optional (`--no-tmux`).
 - Useful env vars: `SATRAP_CONTROL_ROOT` (run root), `SATRAP_TMUX_WINDOW` (tmux window name).
+- When started inside tmux, Satrap auto-spawns into the `SATRAP_TMUX_WINDOW` window (default `satrap`) and now keeps that pane open by default.
+- Use `--kill-pane` to auto-close the top-level auto-spawned Satrap pane; it closes 5 seconds after Satrap exits.

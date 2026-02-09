@@ -92,6 +92,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import hashlib
+import os
 import sys
 from .agents import (
     PlannerBackend,
@@ -104,6 +106,7 @@ from .agents import (
 from .dag import dependency_batches
 from .git_ops import GitClient, GitWorktree
 from .render import RenderRole, write_agent_prompt, write_verifier_prompt
+from .tmux import PaneContext, ensure_window, in_tmux, kill_pane, pane_target, spawn_worktree_pane
 from .todo import TodoDoc, TodoItem, TodoStatus
 
 
@@ -137,55 +140,144 @@ class SatrapConfig:
 
 
 class SatrapOrchestrator:
+    WORKTREE_COLORS = ["green", "yellow", "blue", "magenta", "cyan", "red", "white"]
+    ANSI_COLORS = {
+        "black": "30",
+        "red": "31",
+        "green": "32",
+        "yellow": "33",
+        "blue": "34",
+        "magenta": "35",
+        "cyan": "36",
+        "white": "37",
+    }
+
     def __init__(self, cfg: SatrapConfig) -> None:
         self.cfg = cfg
+        self._pane_by_step: dict[str, PaneContext] = {}
+
+    def _color_for_step(self, *, step_number: str) -> str:
+        idx = int(hashlib.sha1(step_number.encode("utf-8")).hexdigest(), 16) % len(self.WORKTREE_COLORS)
+        return self.WORKTREE_COLORS[idx]
+
+    def _colorize(self, *, text: str, color: str) -> str:
+        code = self.ANSI_COLORS.get(color)
+        if code is None:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    def _tmux_window_name(self) -> str:
+        return os.environ.get("SATRAP_TMUX_WINDOW", "satrap")
+
+    def _worktree_panes_enabled(self) -> bool:
+        if not in_tmux():
+            return False
+        return bool(getattr(self.cfg.worker_backend, "use_tmux_panes", False))
+
+    def _get_or_create_step_pane(self, *, step: TodoItem, step_wt: GitWorktree) -> PaneContext | None:
+        if step.number in self._pane_by_step:
+            return self._pane_by_step[step.number]
+        if not self._worktree_panes_enabled():
+            return None
+
+        pane_id: str | None = None
+        try:
+            window_target = ensure_window(window_name=self._tmux_window_name(), cwd=self.cfg.control_root)
+            color = self._color_for_step(step_number=step.number)
+            pane_id = spawn_worktree_pane(
+                window_target=window_target,
+                cwd=step_wt.path,
+                title=f"{step.number} {step_wt.path.name}",
+                color=color,
+                select=False,
+            )
+            ctx = PaneContext(
+                pane_id=pane_id,
+                window_target=window_target,
+                label=step.number,
+                worktree_path=step_wt.path,
+                color=color,
+            )
+            self._pane_by_step[step.number] = ctx
+
+            target = pane_id
+            try:
+                target = pane_target(pane_id=pane_id)
+            except Exception:
+                pass
+            color_label = self._colorize(text=color, color=color)
+            print(f"[satrap] pane open [{color_label}] step={step.number} pane={target}", file=sys.stderr)
+            return ctx
+        except Exception as exc:
+            if pane_id:
+                kill_pane(pane_id=pane_id)
+            print(f"[satrap] pane open failed step={step.number}: {exc}", file=sys.stderr)
+            return None
+
+    def _close_step_pane(self, *, step_number: str) -> None:
+        pane = self._pane_by_step.pop(step_number, None)
+        if pane is None:
+            return
+        try:
+            kill_pane(pane_id=pane.pane_id)
+            color = pane.color or "white"
+            color_label = self._colorize(text=color, color=color)
+            print(f"[satrap] pane close [{color_label}] step={step_number}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[satrap] pane close failed step={step_number}: {exc}", file=sys.stderr)
+
+    def _close_all_panes(self) -> None:
+        for step_number in list(self._pane_by_step.keys()):
+            self._close_step_pane(step_number=step_number)
+
+    def _step_tag(self, *, step_number: str) -> str:
+        color = self._color_for_step(step_number=step_number)
+        return self._colorize(text=f"step {step_number}", color=color)
 
     def run(self, *, task_text: str, start_step: str | None, reset_todo: bool = False) -> None:
         """Entry point for the CLI.
 
         `task_text` is only used to initialize the todo file when it does not exist.
         """
-        todo = self._load_or_init_todo(task_text=task_text, reset_todo=reset_todo)
-        print(f"[satrap] todo: {self.cfg.todo_json_path}", file=sys.stderr)
-        print(f"[satrap] todo context: {(todo.context or '').strip()!r}", file=sys.stderr)
-        print(f"[satrap] todo stats: items={len(todo.items)} complete={todo.is_complete()}", file=sys.stderr)
+        try:
+            todo = self._load_or_init_todo(task_text=task_text, reset_todo=reset_todo)
+            print(f"[satrap] todo: {self.cfg.todo_json_path}", file=sys.stderr)
+            print(f"[satrap] todo context: {(todo.context or '').strip()!r}", file=sys.stderr)
+            print(f"[satrap] todo stats: items={len(todo.items)} complete={todo.is_complete()}", file=sys.stderr)
 
-        base_branch = self.cfg.git.current_branch(cwd=self.cfg.control_root)
-        root_branch = "satrap/root"
-        root_wt = self.cfg.git.ensure_worktree(
-            branch=root_branch,
-            base_ref=base_branch,
-            worktrees_dir=self.cfg.worktrees_dir,
-            phrases_path=self.cfg.phrases_path,
-        )
-        print(f"[satrap] root worktree: {root_wt.branch} -> {root_wt.path}", file=sys.stderr)
+            base_branch = self.cfg.git.current_branch(cwd=self.cfg.control_root)
+            root_branch = "satrap/root"
+            root_wt = self.cfg.git.ensure_worktree(
+                branch=root_branch,
+                base_ref=base_branch,
+                worktrees_dir=self.cfg.worktrees_dir,
+                phrases_path=self.cfg.phrases_path,
+            )
+            print(f"[satrap] root worktree: {root_wt.branch} -> {root_wt.path}", file=sys.stderr)
 
-        if start_step is None:
-            self._ensure_planned(todo=todo, step_number=None)
-            todo = self._reload_todo()
-            if todo.is_complete():
-                print("[satrap] all steps DONE; nothing to do.", file=sys.stderr)
+            if start_step is None:
+                self._ensure_planned(todo=todo, step_number=None, pane=None)
+                todo = self._reload_todo()
+                if todo.is_complete():
+                    print("[satrap] all steps DONE; nothing to do.", file=sys.stderr)
+                    return
+                for batch in dependency_batches(todo.items, is_done=lambda n: self._reload_todo().is_done(n)):
+                    for item in batch:
+                        self._run_step(todo=todo, step_number=item.number, parent_branch=root_branch, parent_wt=root_wt)
+                        todo = self._reload_todo()
                 return
-            for batch in dependency_batches(todo.items, is_done=lambda n: self._reload_todo().is_done(n)):
-                # Placeholder: this can be parallelized safely once git worktree concurrency rules are settled.
-                for item in batch:
-                    self._run_step(todo=todo, step_number=item.number, parent_branch=root_branch, parent_wt=root_wt)
-                    todo = self._reload_todo()
 
-            # Placeholder: verify full project, then merge root into base.
-            # self._verify_and_merge_root(...)
-            return
-
-        # Resumed / focused run.
-        item = todo.get_item(start_step)
-        parent_branch = root_branch if "." not in item.number else f"satrap/{item.number.rsplit('.', 1)[0]}"
-        parent_wt = self.cfg.git.ensure_worktree(
-            branch=parent_branch,
-            base_ref=root_branch,
-            worktrees_dir=self.cfg.worktrees_dir,
-            phrases_path=self.cfg.phrases_path,
-        )
-        self._run_step(todo=todo, step_number=item.number, parent_branch=parent_branch, parent_wt=parent_wt)
+            item = todo.get_item(start_step)
+            parent_branch = root_branch if "." not in item.number else f"satrap/{item.number.rsplit('.', 1)[0]}"
+            parent_wt = self.cfg.git.ensure_worktree(
+                branch=parent_branch,
+                base_ref=root_branch,
+                worktrees_dir=self.cfg.worktrees_dir,
+                phrases_path=self.cfg.phrases_path,
+            )
+            self._run_step(todo=todo, step_number=item.number, parent_branch=parent_branch, parent_wt=parent_wt)
+        finally:
+            self._close_all_panes()
 
     def _run_step(self, *, todo: TodoDoc, step_number: str, parent_branch: str, parent_wt: GitWorktree) -> None:
         current = todo.get_item(step_number)
@@ -193,6 +285,9 @@ class SatrapOrchestrator:
             return
         if current.status == TodoStatus.BLOCKED:
             return
+
+        tag = self._step_tag(step_number=step_number)
+        print(f"[satrap] {tag} step start", file=sys.stderr)
 
         # Mark doing early (single source of truth).
         todo.set_status(step_number, TodoStatus.DOING)
@@ -205,28 +300,41 @@ class SatrapOrchestrator:
             worktrees_dir=self.cfg.worktrees_dir,
             phrases_path=self.cfg.phrases_path,
         )
-        print(f"[satrap] step worktree: {step_wt.branch} -> {step_wt.path}", file=sys.stderr)
+        pane = self._get_or_create_step_pane(step=current, step_wt=step_wt)
 
-        self._ensure_planned(todo=todo, step_number=step_number)
-        todo = self._reload_todo()
-        step = todo.get_item(step_number)
+        try:
+            self._ensure_planned(todo=todo, step_number=step_number, pane=pane)
+            todo = self._reload_todo()
+            step = todo.get_item(step_number)
 
-        if not step.children:
-            # Atomic: implement directly on this step branch (and retry tiers on failure).
-            self._implement_atomic(todo=todo, step=step, step_wt=step_wt, parent_branch=parent_branch, parent_wt=parent_wt)
-            return
+            if not step.children:
+                self._implement_atomic(
+                    todo=todo,
+                    step=step,
+                    step_wt=step_wt,
+                    parent_branch=parent_branch,
+                    parent_wt=parent_wt,
+                    pane=pane,
+                )
+                return
 
-        # Non-atomic: recurse into children in dependency order, merging each child into this step branch.
-        for batch in dependency_batches(step.children, is_done=lambda n: self._reload_todo().is_done(n)):
-            for child in batch:
-                self._run_step(todo=todo, step_number=child.number, parent_branch=step_branch, parent_wt=step_wt)
-                todo = self._reload_todo()
+            for batch in dependency_batches(step.children, is_done=lambda n: self._reload_todo().is_done(n)):
+                for child in batch:
+                    self._run_step(todo=todo, step_number=child.number, parent_branch=step_branch, parent_wt=step_wt)
+                    todo = self._reload_todo()
 
-        # Placeholder: verify the aggregate step work, then merge into parent.
-        # For now, treat completion as "all children done".
-        self._merge_step_into_parent(todo=todo, step=step, step_branch=step_branch, parent_branch=parent_branch, parent_wt=parent_wt)
+            self._merge_step_into_parent(
+                todo=todo,
+                step=step,
+                step_branch=step_branch,
+                parent_branch=parent_branch,
+                parent_wt=parent_wt,
+            )
+        finally:
+            print(f"[satrap] {tag} step end", file=sys.stderr)
+            self._close_step_pane(step_number=step_number)
 
-    def _ensure_planned(self, *, todo: TodoDoc, step_number: str | None) -> None:
+    def _ensure_planned(self, *, todo: TodoDoc, step_number: str | None, pane: PaneContext | None = None) -> None:
         """Planner phase: break down current task into smaller tasks (children)."""
         if step_number is None:
             if todo.items:
@@ -247,6 +355,7 @@ class SatrapOrchestrator:
             prompt_file=planner_prompt,
             schema_file=self.cfg.todo_schema_path,
             step_number=step_number,
+            pane=pane,
         )
 
         # Single source of truth update.
@@ -271,6 +380,7 @@ class SatrapOrchestrator:
         step_wt: GitWorktree,
         parent_branch: str,
         parent_wt: GitWorktree,
+        pane: PaneContext | None = None,
     ) -> None:
         base_commit = self.cfg.git.merge_base(
             branch=step_wt.branch,
@@ -278,8 +388,9 @@ class SatrapOrchestrator:
             cwd=step_wt.path,
         )
 
+        tag = self._step_tag(step_number=step.number)
         for tier in self.cfg.model_tiers:
-            print(f"[satrap] worker tier: {' '.join(tier)} step={step.number}", file=sys.stderr)
+            print(f"[satrap] {tag} worker start tier={' '.join(tier)}", file=sys.stderr)
             worker_prompt = write_agent_prompt(
                 cfg=self.cfg,
                 todo=todo,
@@ -287,8 +398,9 @@ class SatrapOrchestrator:
                 role=RenderRole.WORKER,
             )
 
-            run = self.cfg.worker_backend.spawn(tier=tier, prompt_file=worker_prompt, cwd=step_wt.path)
+            run = self.cfg.worker_backend.spawn(tier=tier, prompt_file=worker_prompt, cwd=step_wt.path, pane=pane)
             outcome = self.cfg.worker_backend.watch(run)
+            print(f"[satrap] {tag} worker end exit={outcome.exit_code}", file=sys.stderr)
             if outcome.exit_code != 0:
                 self._append_lesson(
                     step=step,
@@ -312,7 +424,14 @@ class SatrapOrchestrator:
                 diff=diff,
                 commits=commits,
             )
-            verdict: VerificationResult = self.cfg.verifier_backend.verify(prompt_file=verifier_prompt, diff=diff, commits=commits, step=step)
+            verdict: VerificationResult = self.cfg.verifier_backend.verify(
+                prompt_file=verifier_prompt,
+                diff=diff,
+                commits=commits,
+                step=step,
+                pane=pane,
+            )
+            print(f"[satrap] {tag} verifier passed={verdict.passed}", file=sys.stderr)
             if verdict.passed:
                 self._merge_step_into_parent(
                     todo=todo,
@@ -345,6 +464,7 @@ class SatrapOrchestrator:
             target_branch=parent_branch,
             cwd=parent_wt.path,
         )
+        print(f"[satrap] {self._step_tag(step_number=step.number)} merge {step_branch} -> {parent_branch}", file=sys.stderr)
         todo.set_status(step.number, TodoStatus.DONE)
         self._save_todo(todo)
 
