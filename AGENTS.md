@@ -103,8 +103,10 @@ pip install -e .
 
 ## Testing Guidelines
 
-- No automated test suite is checked in yet.
-- If adding tests, prefer `pytest` and place files under `tests/` as `test_*.py`. Keep unit tests deterministic; avoid invoking `git`, `tmux`, or `claude` unless explicitly writing integration tests.
+- Automated tests live under `tests/` and use `pytest`.
+- Run the full suite with:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q`
+- Keep unit tests deterministic; avoid invoking `git`, `tmux`, or `claude` unless explicitly writing integration tests.
 
 ## Commit & Pull Request Guidelines
 

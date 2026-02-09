@@ -40,3 +40,53 @@
 - [x] Worker attempts now run in per-step worktree tmux panes (remain visible after exit) instead of only running in the top-level satrap pane.
 - [x] `.satrap/todo.json` now resets when task input changes and the previous plan is complete (or when forced via `--reset-todo`), with archival copies under `.satrap/todo-history/`.
 - [x] Satrap now prints explicit diagnostics about which `todo.json` is loaded, its context, and whether it is exiting because all steps are already done.
+
+## 2026-02-09: Comprehensive Test Suite (excluding tmux)
+
+### Plan
+- [x] Enumerate all `satrap/*.py` modules except `satrap/tmux.py` and map test cases per public behavior and edge-path.
+- [x] Use parallel subagents to author pytest files in `tests/`, with one focused ownership slice per module group.
+- [x] Integrate agent outputs, resolve overlaps, and ensure imports/fixtures/mocks are consistent across the suite.
+- [x] Run the full test suite, fix failures, and rerun until green.
+- [x] Update `AGENTS.md` with explicit test command guidance for this repository.
+- [ ] Stage all changes, commit, merge to `main`, and push `main` to `origin`.
+
+### Results
+- [x] Added comprehensive pytest coverage for all `satrap/*.py` modules except `satrap/tmux.py`.
+- [x] Added test files: `test_agents.py`, `test_claude_cli.py`, `test_cli.py`, `test_dag.py`, `test_entrypoints.py`, `test_git_ops.py`, `test_orchestrator.py`, `test_phrases.py`, `test_render.py`, `test_todo.py`.
+- [x] Verified full suite with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q` -> `95 passed`.
+- [ ] Pending git stage/commit/merge/push.
+
+
+## 2026-02-09: Targeted Tests for render.py + claude_cli.py
+
+### Plan
+- [x] Review `satrap/render.py` and `satrap/claude_cli.py` behaviors and map each requested edge case to explicit pytest cases.
+- [x] Add `tests/test_render.py` with coverage for ancestor/path rendering, status glyph fallback, planner/worker/verifier instruction blocks, lessons extraction/section behavior, and verifier prompt formatting (empty commits + diff trimming).
+- [x] Add `tests/test_claude_cli.py` with coverage for JSON envelope parsing paths, structured_output preference, result-string fallback parse, jq error path, and `run_claude_json_from_files` stream behavior via monkeypatched `subprocess`/`selectors`.
+- [x] Run targeted pytest selection for the new files, fix failures, and rerun until green.
+- [x] Document outcomes and changed files in this section.
+
+### Results
+- [x] Added `tests/test_render.py` with 7 tests covering path-aware rendering, glyph fallback, role instructions, lessons extraction/loading behavior, and verifier prompt formatting edge cases.
+- [x] Added `tests/test_claude_cli.py` with 5 tests covering envelope parsing branches, structured-output precedence, result-string best-effort JSON parse, jq missing-path error handling, and streamed subprocess/selectors behavior.
+- [x] Verification command: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q tests/test_render.py tests/test_claude_cli.py`.
+- [x] Outcome: `12 passed in 0.03s`.
+
+## 2026-02-09: `satrap/orchestrator.py` Edge Test Coverage
+
+### Plan
+- [x] Build test harness fakes for planner/worker/verifier/git and prompt writers so tests never call external tools.
+- [x] Add `run()` coverage for root flow and start-step flow parent-worktree selection.
+- [x] Add `_ensure_planned()` coverage for root no-op/root plan, specific-step no-op, atomic refinement, and child upsert behavior.
+- [x] Add `_implement_atomic()` coverage for tier retry on worker non-zero, verifier reject reset/retry, and final blocked transition with lesson writes.
+- [x] Add merge/state coverage for `_merge_step_into_parent()` setting `done` and saving.
+- [x] Add `_load_or_init_todo()` coverage for initial create, reset archive path, mismatch rejection, and complete-plan replacement.
+- [x] Add `_append_under_section()` coverage for empty text bootstrap, existing placeholder replacement, and missing-header insertion.
+- [x] Run targeted pytest for the new orchestrator tests and capture outcomes.
+
+### Results
+- [x] Added `tests/test_orchestrator.py` with 17 isolated tests covering `run()`, `_ensure_planned()`, `_implement_atomic()`, blocked/lesson behavior, `_merge_step_into_parent()`, `_load_or_init_todo()`, and `_append_under_section()`.
+- [x] Used fake planner/worker/verifier/git backends and monkeypatched prompt writers to keep tests hermetic and avoid external CLI/tool invocations.
+- [x] Verification command: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_orchestrator.py -q`.
+- [x] Outcome: `17 passed in 0.06s`.
